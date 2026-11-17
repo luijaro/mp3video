@@ -3,14 +3,19 @@
 *.exe
 *.pdb
 
-# Credenciales y tokens de YouTube / Google Cloud (NUNCA subir)
+# Credenciales, tokens y configuración local (NUNCA subir)
 client_secret*.json
 youtube_tokens.json
 uploaded_youtube.json
+mp3video_settings.json
 
 # Archivos multimedia y salidas
 /output/
 *.mp3
+*.flac
+*.wav
+*.ape
+*.cue
 *.mp4
 *.part.mp4
 *.png

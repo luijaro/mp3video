@@ -71,6 +71,10 @@ pub(crate) struct TokenStore {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_at_epoch: u64,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -386,13 +390,15 @@ pub(crate) fn authorize_interactive(
         access_token,
         refresh_token,
         expires_at_epoch: now_epoch() + expires_in,
+        client_id: creds.client_id,
+        client_secret: creds.client_secret,
     };
     save_tokens(token_store_path, &store)?;
     Ok(store)
 }
 
 pub(crate) fn get_valid_access_token(
-    client_secret_path: &Path,
+    client_secret_path: Option<&Path>,
     token_store_path: &Path,
 ) -> Result<String> {
     if !token_store_path.is_file() {
@@ -415,7 +421,17 @@ pub(crate) fn get_valid_access_token(
         bail!("El token expiró y no hay refresh_token. Volvé a presionar 'Conectar YouTube'.");
     }
 
-    let creds = load_client_credentials(client_secret_path)?;
+    let creds = if let Some(path) = client_secret_path.filter(|p| p.is_file()) {
+        load_client_credentials(path)?
+    } else if !store.client_id.is_empty() && !store.client_secret.is_empty() {
+        ClientCredentials {
+            client_id: store.client_id.clone(),
+            client_secret: store.client_secret.clone(),
+        }
+    } else {
+        bail!("El token de YouTube expiró y falta client_secret.json para renovarlo. Seleccioná tu client_secret.json o volvé a conectar.");
+    };
+
     let resp = curl_post_form(
         GOOGLE_TOKEN_URL,
         &[
@@ -435,6 +451,8 @@ pub(crate) fn get_valid_access_token(
 
     store.access_token = new_access.clone();
     store.expires_at_epoch = now_epoch() + expires_in;
+    store.client_id = creds.client_id;
+    store.client_secret = creds.client_secret;
     save_tokens(token_store_path, &store)?;
     Ok(new_access)
 }
@@ -731,7 +749,7 @@ pub(crate) struct UploadBatchSummary {
 pub(crate) fn upload_videos_batch<FLog, FProg>(
     items: &[UploadItem],
     output_dir: &Path,
-    client_secret_path: &Path,
+    client_secret_path: Option<&Path>,
     privacy: PrivacyStatus,
     playlist_title: Option<(&str, &str)>,
     cancel_flag: Option<&AtomicBool>,

@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod cue;
 mod gui;
 mod vgmdb;
 mod youtube;
@@ -138,6 +139,10 @@ struct Cli {
     /// Plantilla para la descripción en YouTube
     #[arg(long, default_value = DEFAULT_DESC_TEMPLATE)]
     desc_template: String,
+
+    /// Extraer archivos .mp3 individuales desde una hoja .cue + .flac en lugar de generar videos
+    #[arg(long)]
+    split_mp3: bool,
 }
 
 pub(crate) struct RenderConfig {
@@ -494,13 +499,15 @@ pub(crate) fn resolve_image(
     None
 }
 
-pub(crate) fn render_single(
+fn run_ffmpeg_video_render(
     ffmpeg: &Path,
-    job: &RenderJob,
+    audio_path: &Path,
+    time_range: Option<(f64, Option<f64>)>,
     image_path: &Path,
+    output_path: &Path,
     cfg: &RenderConfig,
 ) -> Result<()> {
-    if let Some(parent) = job.output_path.parent() {
+    if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent).with_context(|| {
             format!(
                 "No se pudo crear la carpeta de salida: {}",
@@ -509,14 +516,11 @@ pub(crate) fn render_single(
         })?;
     }
 
-    let file_name = job
-        .output_path
+    let file_name = output_path
         .file_name()
         .unwrap_or_else(|| OsStr::new("video.mp4"))
         .to_string_lossy();
-    let temp_output = job
-        .output_path
-        .with_file_name(format!(".{}.part.mp4", file_name));
+    let temp_output = output_path.with_file_name(format!(".{}.part.mp4", file_name));
 
     let mut cmd = new_hidden_command(ffmpeg);
     cmd.arg("-hide_banner")
@@ -528,9 +532,17 @@ pub(crate) fn render_single(
         .arg("-framerate")
         .arg(cfg.fps.to_string())
         .arg("-i")
-        .arg(image_path)
-        .arg("-i")
-        .arg(&job.mp3_path);
+        .arg(image_path);
+
+    if let Some((start_secs, end_secs)) = time_range {
+        cmd.arg("-ss").arg(format!("{:.3}", start_secs));
+        if let Some(end) = end_secs {
+            let dur = (end - start_secs).max(0.1);
+            cmd.arg("-t").arg(format!("{:.3}", dur));
+        }
+    }
+
+    cmd.arg("-i").arg(audio_path);
 
     let width = cfg.width;
     let height = cfg.height;
@@ -579,7 +591,7 @@ pub(crate) fn render_single(
         .arg("-crf")
         .arg(cfg.crf.to_string());
 
-    if cfg.copy_audio {
+    if cfg.copy_audio && time_range.is_none() {
         cmd.arg("-c:a").arg("copy");
     } else {
         cmd.arg("-c:a").arg("aac").arg("-b:a").arg(&cfg.audio_bitrate);
@@ -594,7 +606,7 @@ pub(crate) fn render_single(
 
     let output = cmd
         .output()
-        .with_context(|| format!("No se pudo ejecutar ffmpeg para {}", job.mp3_path.display()))?;
+        .with_context(|| format!("No se pudo ejecutar ffmpeg para {}", audio_path.display()))?;
 
     if !output.status.success() {
         let _ = fs::remove_file(&temp_output);
@@ -607,18 +619,107 @@ pub(crate) fn render_single(
         bail!(detail);
     }
 
-    if job.output_path.exists() {
-        let _ = fs::remove_file(&job.output_path);
+    if output_path.exists() {
+        let _ = fs::remove_file(output_path);
     }
-    fs::rename(&temp_output, &job.output_path).with_context(|| {
+    fs::rename(&temp_output, output_path).with_context(|| {
         let _ = fs::remove_file(&temp_output);
         format!(
             "No se pudo mover el video final a {}",
-            job.output_path.display()
+            output_path.display()
         )
     })?;
 
     Ok(())
+}
+
+pub(crate) fn render_single(
+    ffmpeg: &Path,
+    job: &RenderJob,
+    image_path: &Path,
+    cfg: &RenderConfig,
+) -> Result<()> {
+    run_ffmpeg_video_render(
+        ffmpeg,
+        &job.mp3_path,
+        None,
+        image_path,
+        &job.output_path,
+        cfg,
+    )
+}
+
+pub(crate) fn render_cue_track_to_mp4(
+    ffmpeg: &Path,
+    audio_path: &Path,
+    track: &cue::CueTrack,
+    image_path: &Path,
+    output_path: &Path,
+    cfg: &RenderConfig,
+) -> Result<()> {
+    run_ffmpeg_video_render(
+        ffmpeg,
+        audio_path,
+        Some((track.start_secs, track.end_secs)),
+        image_path,
+        output_path,
+        cfg,
+    )
+}
+
+pub(crate) fn build_upload_items_for_cue(
+    tracks: &[(cue::CueTrack, PathBuf)],
+    cue_sheet: &cue::CueSheet,
+    album: Option<&vgmdb::AlbumMetadata>,
+    title_tpl: &str,
+    desc_tpl: &str,
+) -> Vec<youtube::UploadItem> {
+    tracks
+        .iter()
+        .filter(|(_, mp4)| mp4.is_file())
+        .map(|(tr, mp4)| {
+            let album_title = album
+                .map(|a| a.album_title.clone())
+                .filter(|s| !s.is_empty())
+                .or_else(|| cue_sheet.album_title.clone())
+                .unwrap_or_default();
+            let composers = album
+                .map(|a| a.composers.join(", "))
+                .filter(|s| !s.is_empty())
+                .or_else(|| tr.performer.clone())
+                .or_else(|| cue_sheet.performer.clone())
+                .unwrap_or_default();
+            let meta = vgmdb::ResolvedTrackMetadata {
+                album_title,
+                catalog: album
+                    .map(|a| a.catalog.clone())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| cue_sheet.catalog.clone())
+                    .unwrap_or_default(),
+                disc_number: 1,
+                track_number: tr.track_number,
+                track_title: tr.title.clone(),
+                composers,
+                arrangers: album.map(|a| a.arrangers.join(", ")).unwrap_or_default(),
+                performers: album.map(|a| a.performers.join(", ")).unwrap_or_default(),
+                publisher: album.map(|a| a.publisher.clone()).unwrap_or_default(),
+                release_date: album
+                    .map(|a| a.release_date.clone())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| cue_sheet.date.clone())
+                    .unwrap_or_default(),
+            };
+            let title = vgmdb::format_title(title_tpl, &meta);
+            let description = vgmdb::format_description(desc_tpl, &meta);
+            let tags = vgmdb::build_tags(&meta);
+            youtube::UploadItem {
+                mp4_path: mp4.clone(),
+                title,
+                description,
+                tags,
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn build_upload_items(
@@ -727,8 +828,11 @@ fn run_cli() -> Result<()> {
     }
 
     let yt_privacy = youtube::PrivacyStatus::from_str_lossy(&cli.youtube_privacy)?;
-    if cli.youtube_upload && cli.client_secret.is_none() {
-        bail!("Para usar --youtube-upload debés indicar --client-secret <RUTA_JSON>.");
+    if cli.youtube_upload
+        && cli.client_secret.is_none()
+        && !youtube::has_saved_tokens(&youtube::default_token_store_path())
+    {
+        bail!("Para usar --youtube-upload debés indicar --client-secret <RUTA_JSON> o haber conectado la cuenta en la interfaz.");
     }
 
     let (width, height) = parse_resolution(&cli.resolution)?;
@@ -765,6 +869,23 @@ fn run_cli() -> Result<()> {
     };
 
     let ffmpeg = find_ffmpeg(cfg.ffmpeg_path.as_deref())?;
+
+    if let Some(cue_path) = cue::resolve_cue_for_input(&cfg.input) {
+        return run_cue_cli(
+            &cue_path,
+            &ffmpeg,
+            &cfg,
+            album_meta.as_ref(),
+            cli.split_mp3,
+            cli.youtube_upload,
+            cli.client_secret.as_deref(),
+            yt_privacy,
+            cli.youtube_playlist,
+            &cli.title_template,
+            &cli.desc_template,
+        );
+    }
+
     let (input_base, mp3_files) = collect_mp3_files(&cfg.input, &cfg.output, cfg.recursive)?;
 
     if mp3_files.is_empty() {
@@ -915,7 +1036,6 @@ fn run_cli() -> Result<()> {
     }
 
     if cli.youtube_upload {
-        let secret_path = cli.client_secret.as_ref().expect("validado arriba");
         let items = build_upload_items(
             &all_pairs,
             album_meta.as_ref(),
@@ -923,28 +1043,12 @@ fn run_cli() -> Result<()> {
             &cli.title_template,
             &cli.desc_template,
         );
-        let pl_title_opt = if cli.youtube_playlist {
-            album_meta.as_ref().map(|a| {
-                let t = if a.catalog.is_empty() {
-                    a.album_title.clone()
-                } else {
-                    format!("{} ({})", a.album_title, a.catalog)
-                };
-                let d = if a.composers.is_empty() {
-                    a.album_title.clone()
-                } else {
-                    format!("Composer(s): {}", a.composers.join(", "))
-                };
-                (t, d)
-            })
-        } else {
-            None
-        };
+        let pl_title_opt = playlist_meta_tuple(cli.youtube_playlist, album_meta.as_ref());
 
         let summary = youtube::upload_videos_batch(
             &items,
             &cfg.output,
-            secret_path,
+            cli.client_secret.as_deref(),
             yt_privacy,
             pl_title_opt.as_ref().map(|(t, d)| (t.as_str(), d.as_str())),
             None,
@@ -959,6 +1063,180 @@ fn run_cli() -> Result<()> {
         if summary.err_count > 0 {
             err_count += summary.err_count;
         }
+    }
+
+    if err_count > 0 {
+        bail!("Finalizó con {} error(es).", err_count);
+    }
+
+    Ok(())
+}
+
+fn playlist_meta_tuple(
+    create_playlist: bool,
+    album_meta: Option<&vgmdb::AlbumMetadata>,
+) -> Option<(String, String)> {
+    if !create_playlist {
+        return None;
+    }
+    album_meta.map(|a| {
+        let t = if a.catalog.is_empty() {
+            a.album_title.clone()
+        } else {
+            format!("{} ({})", a.album_title, a.catalog)
+        };
+        let d = if a.composers.is_empty() {
+            a.album_title.clone()
+        } else {
+            format!("Composer(s): {}", a.composers.join(", "))
+        };
+        (t, d)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_cue_cli(
+    cue_path: &Path,
+    ffmpeg: &Path,
+    cfg: &RenderConfig,
+    album_meta: Option<&vgmdb::AlbumMetadata>,
+    split_mp3: bool,
+    youtube_upload: bool,
+    client_secret: Option<&Path>,
+    yt_privacy: youtube::PrivacyStatus,
+    youtube_playlist: bool,
+    title_tpl: &str,
+    desc_tpl: &str,
+) -> Result<()> {
+    let cue_sheet = cue::parse_cue_file(cue_path)?;
+    println!(
+        "CUE cargado: {} -> Audio: {} ({} pistas)",
+        cue_sheet.cue_path.display(),
+        cue_sheet.audio_path.display(),
+        cue_sheet.tracks.len()
+    );
+
+    if split_mp3 {
+        let album_ovr = album_meta.map(|a| a.album_title.as_str());
+        let artist_ovr = album_meta
+            .map(|a| a.composers.join(", "))
+            .filter(|s| !s.is_empty());
+        let (ok, skipped, errs) = cue::split_cue_to_mp3(
+            &cue_sheet,
+            &cue_sheet.tracks,
+            &cfg.output,
+            album_ovr,
+            artist_ovr.as_deref(),
+            ffmpeg,
+            cfg.jobs,
+            cfg.overwrite,
+            None,
+            |line| println!("{}", line),
+            |done, total, msg| println!("[{}/{}] {}", done, total, msg),
+        )?;
+        println!(
+            "\nResumen CUE -> MP3: {} extraído(s), {} omitido(s), {} error(es).",
+            ok, skipped, errs
+        );
+        if errs > 0 {
+            bail!("Finalizó con {} error(es).", errs);
+        }
+        return Ok(());
+    }
+
+    let cue_dir = cue_sheet
+        .cue_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let image_path = resolve_image(&cue_sheet.audio_path, cfg.image.as_deref(), cue_dir)
+        .context("No se encontró imagen para renderizar el CUE (indicá una con --image o colocá una portada en la carpeta)")?;
+
+    fs::create_dir_all(&cfg.output)?;
+
+    let mut all_pairs = Vec::with_capacity(cue_sheet.tracks.len());
+    let mut pending = Vec::new();
+    let mut skipped_count = 0usize;
+
+    for tr in &cue_sheet.tracks {
+        let stem = cue::cue_track_output_stem(tr);
+        let out_mp4 = cfg.output.join(format!("{}.mp4", stem));
+        all_pairs.push((tr.clone(), out_mp4.clone()));
+        if out_mp4.exists() && !cfg.overwrite {
+            skipped_count += 1;
+            continue;
+        }
+        pending.push((tr.clone(), out_mp4));
+    }
+
+    let mut err_count = 0usize;
+    if !pending.is_empty() {
+        let started = Instant::now();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(cfg.jobs).build()?;
+        let ok_count = AtomicUsize::new(0);
+        let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+        pool.install(|| {
+            pending.par_iter().for_each(|(tr, out_mp4)| {
+                match render_cue_track_to_mp4(
+                    ffmpeg,
+                    &cue_sheet.audio_path,
+                    tr,
+                    &image_path,
+                    out_mp4,
+                    cfg,
+                ) {
+                    Ok(()) => {
+                        ok_count.fetch_add(1, Ordering::Relaxed);
+                        println!("[OK] {:02} - {}", tr.track_number, tr.title);
+                    }
+                    Err(e) => {
+                        if let Ok(mut g) = errors.lock() {
+                            g.push(format!("{:02} - {}: {:#}", tr.track_number, tr.title, e));
+                        }
+                    }
+                }
+            });
+        });
+
+        let err_list = errors.into_inner().unwrap_or_default();
+        err_count = err_list.len();
+        println!(
+            "\nResumen CUE -> MP4 en {:.1}s: {} renderizado(s), {} omitido(s), {} error(es).",
+            started.elapsed().as_secs_f64(),
+            ok_count.load(Ordering::Relaxed),
+            skipped_count,
+            err_count
+        );
+        for e in err_list {
+            eprintln!("  - {}", e);
+        }
+    }
+
+    if youtube_upload {
+        let items = build_upload_items_for_cue(
+            &all_pairs,
+            &cue_sheet,
+            album_meta,
+            title_tpl,
+            desc_tpl,
+        );
+        let pl_title_opt = playlist_meta_tuple(youtube_playlist, album_meta);
+        let summary = youtube::upload_videos_batch(
+            &items,
+            &cfg.output,
+            client_secret,
+            yt_privacy,
+            pl_title_opt.as_ref().map(|(t, d)| (t.as_str(), d.as_str())),
+            None,
+            |line| println!("{}", line),
+            |done, total, msg| println!("YouTube [{}/{}] {}", done, total, msg),
+        )?;
+        println!(
+            "\nResumen YouTube: {} subido(s), {} omitido(s), {} error(es).",
+            summary.uploaded_count, summary.skipped_count, summary.err_count
+        );
+        err_count += summary.err_count;
     }
 
     if err_count > 0 {
