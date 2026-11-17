@@ -1,0 +1,24 @@
+# Rust build artifacts
+/target/
+*.exe
+*.pdb
+
+# Credenciales y tokens de YouTube / Google Cloud (NUNCA subir)
+client_secret*.json
+youtube_tokens.json
+uploaded_youtube.json
+
+# Archivos multimedia y salidas
+/output/
+*.mp3
+*.mp4
+*.part.mp4
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.bmp
+
+# OS
+Thumbs.db
+.DS_Store
