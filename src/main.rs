@@ -143,6 +143,10 @@ struct Cli {
     /// Extraer archivos .mp3 individuales desde una hoja .cue + .flac en lugar de generar videos
     #[arg(long)]
     split_mp3: bool,
+
+    /// Renderizar 1 solo video largo del álbum completo con capítulos y timestamps
+    #[arg(long)]
+    full_album: bool,
 }
 
 pub(crate) struct RenderConfig {
@@ -499,51 +503,7 @@ pub(crate) fn resolve_image(
     None
 }
 
-fn run_ffmpeg_video_render(
-    ffmpeg: &Path,
-    audio_path: &Path,
-    time_range: Option<(f64, Option<f64>)>,
-    image_path: &Path,
-    output_path: &Path,
-    cfg: &RenderConfig,
-) -> Result<()> {
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "No se pudo crear la carpeta de salida: {}",
-                parent.display()
-            )
-        })?;
-    }
-
-    let file_name = output_path
-        .file_name()
-        .unwrap_or_else(|| OsStr::new("video.mp4"))
-        .to_string_lossy();
-    let temp_output = output_path.with_file_name(format!(".{}.part.mp4", file_name));
-
-    let mut cmd = new_hidden_command(ffmpeg);
-    cmd.arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-y")
-        .arg("-loop")
-        .arg("1")
-        .arg("-framerate")
-        .arg(cfg.fps.to_string())
-        .arg("-i")
-        .arg(image_path);
-
-    if let Some((start_secs, end_secs)) = time_range {
-        cmd.arg("-ss").arg(format!("{:.3}", start_secs));
-        if let Some(end) = end_secs {
-            let dur = (end - start_secs).max(0.1);
-            cmd.arg("-t").arg(format!("{:.3}", dur));
-        }
-    }
-
-    cmd.arg("-i").arg(audio_path);
-
+fn apply_video_and_codec_args(cmd: &mut Command, cfg: &RenderConfig, allow_copy_audio: bool) {
     let width = cfg.width;
     let height = cfg.height;
     match cfg.fit {
@@ -591,25 +551,32 @@ fn run_ffmpeg_video_render(
         .arg("-crf")
         .arg(cfg.crf.to_string());
 
-    if cfg.copy_audio && time_range.is_none() {
+    if allow_copy_audio && cfg.copy_audio {
         cmd.arg("-c:a").arg("copy");
     } else {
         cmd.arg("-c:a").arg("aac").arg("-b:a").arg(&cfg.audio_bitrate);
     }
+}
 
+fn finalize_ffmpeg_render(
+    mut cmd: Command,
+    temp_output: &Path,
+    output_path: &Path,
+    err_ctx: &str,
+) -> Result<()> {
     cmd.arg("-shortest")
         .arg("-max_interleave_delta")
         .arg("100M")
         .arg("-movflags")
         .arg("+faststart")
-        .arg(&temp_output);
+        .arg(temp_output);
 
     let output = cmd
         .output()
-        .with_context(|| format!("No se pudo ejecutar ffmpeg para {}", audio_path.display()))?;
+        .with_context(|| format!("No se pudo ejecutar ffmpeg para {}", err_ctx))?;
 
     if !output.status.success() {
-        let _ = fs::remove_file(&temp_output);
+        let _ = fs::remove_file(temp_output);
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let detail = if stderr.is_empty() {
             format!("ffmpeg terminó con código {:?}", output.status.code())
@@ -622,8 +589,8 @@ fn run_ffmpeg_video_render(
     if output_path.exists() {
         let _ = fs::remove_file(output_path);
     }
-    fs::rename(&temp_output, output_path).with_context(|| {
-        let _ = fs::remove_file(&temp_output);
+    fs::rename(temp_output, output_path).with_context(|| {
+        let _ = fs::remove_file(temp_output);
         format!(
             "No se pudo mover el video final a {}",
             output_path.display()
@@ -631,6 +598,230 @@ fn run_ffmpeg_video_render(
     })?;
 
     Ok(())
+}
+
+fn run_ffmpeg_video_render(
+    ffmpeg: &Path,
+    audio_path: &Path,
+    time_range: Option<(f64, Option<f64>)>,
+    image_path: &Path,
+    output_path: &Path,
+    cfg: &RenderConfig,
+) -> Result<()> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "No se pudo crear la carpeta de salida: {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let file_name = output_path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("video.mp4"))
+        .to_string_lossy();
+    let temp_output = output_path.with_file_name(format!(".{}.part.mp4", file_name));
+
+    let mut cmd = new_hidden_command(ffmpeg);
+    cmd.arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-loop")
+        .arg("1")
+        .arg("-framerate")
+        .arg(cfg.fps.to_string())
+        .arg("-i")
+        .arg(image_path);
+
+    if let Some((start_secs, end_secs)) = time_range {
+        cmd.arg("-ss").arg(format!("{:.3}", start_secs));
+        if let Some(end) = end_secs {
+            let dur = (end - start_secs).max(0.1);
+            cmd.arg("-t").arg(format!("{:.3}", dur));
+        }
+    }
+
+    cmd.arg("-i").arg(audio_path);
+    apply_video_and_codec_args(&mut cmd, cfg, time_range.is_none());
+    finalize_ffmpeg_render(cmd, &temp_output, output_path, &audio_path.display().to_string())
+}
+
+pub(crate) fn full_album_output_path(
+    output_dir: &Path,
+    cue_sheet: &cue::CueSheet,
+    album: Option<&vgmdb::AlbumMetadata>,
+) -> PathBuf {
+    let base_name = album
+        .map(|a| a.album_title.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            cue_sheet
+                .album_title
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            cue_sheet
+                .cue_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "Album".to_string());
+
+    let clean = cue::sanitize_filename(&base_name);
+    output_dir.join(format!("{} - Full Soundtrack.mp4", clean))
+}
+
+pub(crate) fn render_full_album_to_mp4(
+    ffmpeg: &Path,
+    tracks: &[cue::CueTrack],
+    fallback_audio: &Path,
+    album_title: Option<&str>,
+    image_path: &Path,
+    output_path: &Path,
+    cfg: &RenderConfig,
+) -> Result<cue::TimelinePlan> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let plan = cue::compute_timeline(tracks, fallback_audio, Some(ffmpeg));
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let ffmeta_path = std::env::temp_dir().join(format!("mp3video_meta_{}.txt", stamp));
+    let concat_path = std::env::temp_dir().join(format!("mp3video_concat_{}.txt", stamp));
+
+    cue::write_ffmetadata_chapters(&ffmeta_path, album_title, &plan.chapters)?;
+
+    let file_name = output_path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("full_album.mp4"))
+        .to_string_lossy();
+    let temp_output = output_path.with_file_name(format!(".{}.part.mp4", file_name));
+
+    let mut cmd = new_hidden_command(ffmpeg);
+    cmd.arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-loop")
+        .arg("1")
+        .arg("-framerate")
+        .arg(cfg.fps.to_string())
+        .arg("-i")
+        .arg(image_path);
+
+    if let Some(ref single_audio) = plan.single_direct_audio {
+        cmd.arg("-i").arg(single_audio);
+    } else {
+        cue::write_ffconcat_file(&concat_path, tracks, fallback_audio)?;
+        cmd.arg("-f")
+            .arg("concat")
+            .arg("-safe")
+            .arg("0")
+            .arg("-i")
+            .arg(&concat_path);
+    }
+
+    cmd.arg("-f").arg("ffmetadata").arg("-i").arg(&ffmeta_path);
+    apply_video_and_codec_args(&mut cmd, cfg, false);
+    cmd.arg("-map_metadata").arg("2").arg("-map_chapters").arg("2");
+
+    let res = finalize_ffmpeg_render(
+        cmd,
+        &temp_output,
+        output_path,
+        &fallback_audio.display().to_string(),
+    );
+    let _ = fs::remove_file(&ffmeta_path);
+    let _ = fs::remove_file(&concat_path);
+    res?;
+    Ok(plan)
+}
+
+pub(crate) fn build_full_album_upload_item(
+    mp4_path: &Path,
+    cue_sheet: &cue::CueSheet,
+    album: Option<&vgmdb::AlbumMetadata>,
+    timestamps_block: &str,
+    desc_tpl: &str,
+) -> youtube::UploadItem {
+    let album_title = album
+        .map(|a| a.album_title.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| cue_sheet.album_title.clone())
+        .or_else(|| {
+            cue_sheet
+                .cue_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| "Full Soundtrack".to_string());
+
+    let composers = album
+        .map(|a| a.composers.join(", "))
+        .filter(|s| !s.is_empty())
+        .or_else(|| cue_sheet.performer.clone())
+        .unwrap_or_default();
+
+    let meta = vgmdb::ResolvedTrackMetadata {
+        album_title: album_title.clone(),
+        catalog: album
+            .map(|a| a.catalog.clone())
+            .filter(|s| !s.is_empty())
+            .or_else(|| cue_sheet.catalog.clone())
+            .unwrap_or_default(),
+        disc_number: 1,
+        track_number: 1,
+        track_title: String::new(),
+        composers,
+        arrangers: album.map(|a| a.arrangers.join(", ")).unwrap_or_default(),
+        performers: album.map(|a| a.performers.join(", ")).unwrap_or_default(),
+        publisher: album.map(|a| a.publisher.clone()).unwrap_or_default(),
+        release_date: album
+            .map(|a| a.release_date.clone())
+            .filter(|s| !s.is_empty())
+            .or_else(|| cue_sheet.date.clone())
+            .unwrap_or_default(),
+    };
+
+    let filtered_desc_tpl: String = desc_tpl
+        .lines()
+        .filter(|line| {
+            !line.contains("{track_title}")
+                && !line.contains("{disc_track}")
+                && !line.contains("{track_num}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let header_desc = vgmdb::apply_template(&filtered_desc_tpl, &meta);
+    let full_desc = if header_desc.is_empty() {
+        format!("Tracklist:\n{}", timestamps_block)
+    } else {
+        format!("{}\n\nTracklist:\n{}", header_desc, timestamps_block)
+    };
+
+    let title = vgmdb::truncate_chars(&format!("{} - Full Soundtrack", album_title), 100);
+    let description = vgmdb::truncate_chars(&full_desc, 4900);
+    let mut tags = vgmdb::build_tags(&meta);
+    if !tags.iter().any(|t| t.eq_ignore_ascii_case("Full Soundtrack")) {
+        tags.push("Full Soundtrack".to_string());
+    }
+
+    youtube::UploadItem {
+        mp4_path: mp4_path.to_path_buf(),
+        title,
+        description,
+        tags,
+    }
 }
 
 pub(crate) fn render_single(
@@ -871,12 +1062,38 @@ fn run_cli() -> Result<()> {
     let ffmpeg = find_ffmpeg(cfg.ffmpeg_path.as_deref())?;
 
     if let Some(cue_path) = cue::resolve_cue_for_input(&cfg.input) {
+        let cue_sheet = cue::parse_cue_file(&cue_path)?;
         return run_cue_cli(
-            &cue_path,
+            &cue_sheet,
             &ffmpeg,
             &cfg,
             album_meta.as_ref(),
             cli.split_mp3,
+            cli.full_album,
+            cli.youtube_upload,
+            cli.client_secret.as_deref(),
+            yt_privacy,
+            cli.youtube_playlist,
+            &cli.title_template,
+            &cli.desc_template,
+        );
+    }
+
+    if cli.full_album {
+        let cue_sheet = cue::build_tracks_from_directory(
+            &cfg.input,
+            &cfg.output,
+            cfg.recursive,
+            album_meta.as_ref(),
+            cfg.ffmpeg_path.as_deref(),
+        )?;
+        return run_cue_cli(
+            &cue_sheet,
+            &ffmpeg,
+            &cfg,
+            album_meta.as_ref(),
+            false,
+            true,
             cli.youtube_upload,
             cli.client_secret.as_deref(),
             yt_privacy,
@@ -1096,11 +1313,12 @@ fn playlist_meta_tuple(
 
 #[allow(clippy::too_many_arguments)]
 fn run_cue_cli(
-    cue_path: &Path,
+    cue_sheet: &cue::CueSheet,
     ffmpeg: &Path,
     cfg: &RenderConfig,
     album_meta: Option<&vgmdb::AlbumMetadata>,
     split_mp3: bool,
+    full_album: bool,
     youtube_upload: bool,
     client_secret: Option<&Path>,
     yt_privacy: youtube::PrivacyStatus,
@@ -1108,9 +1326,8 @@ fn run_cue_cli(
     title_tpl: &str,
     desc_tpl: &str,
 ) -> Result<()> {
-    let cue_sheet = cue::parse_cue_file(cue_path)?;
     println!(
-        "CUE cargado: {} -> Audio: {} ({} pistas)",
+        "CUE/Álbum cargado: {} -> Audio: {} ({} pistas)",
         cue_sheet.cue_path.display(),
         cue_sheet.audio_path.display(),
         cue_sheet.tracks.len()
@@ -1122,7 +1339,7 @@ fn run_cue_cli(
             .map(|a| a.composers.join(", "))
             .filter(|s| !s.is_empty());
         let (ok, skipped, errs) = cue::split_cue_to_mp3(
-            &cue_sheet,
+            cue_sheet,
             &cue_sheet.tracks,
             &cfg.output,
             album_ovr,
@@ -1144,15 +1361,83 @@ fn run_cue_cli(
         return Ok(());
     }
 
-    let cue_dir = cue_sheet
-        .cue_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+    let cue_dir = if cue_sheet.cue_path.is_dir() {
+        cue_sheet.cue_path.as_path()
+    } else {
+        cue_sheet
+            .cue_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+    };
     let image_path = resolve_image(&cue_sheet.audio_path, cfg.image.as_deref(), cue_dir)
-        .context("No se encontró imagen para renderizar el CUE (indicá una con --image o colocá una portada en la carpeta)")?;
+        .context("No se encontró imagen para renderizar (indicá una con --image o colocá una portada en la carpeta)")?;
 
     fs::create_dir_all(&cfg.output)?;
+
+    if full_album {
+        let out_mp4 = full_album_output_path(&cfg.output, cue_sheet, album_meta);
+        let alb_title = album_meta
+            .map(|a| a.album_title.as_str())
+            .or(cue_sheet.album_title.as_deref());
+        let started = Instant::now();
+
+        let plan = if out_mp4.exists() && !cfg.overwrite {
+            println!(
+                "Omitido por ya existir: {} (usá --overwrite para regenerarlo)",
+                out_mp4.display()
+            );
+            cue::compute_timeline(&cue_sheet.tracks, &cue_sheet.audio_path, Some(ffmpeg))
+        } else {
+            let p = render_full_album_to_mp4(
+                ffmpeg,
+                &cue_sheet.tracks,
+                &cue_sheet.audio_path,
+                alb_title,
+                &image_path,
+                &out_mp4,
+                cfg,
+            )?;
+            println!(
+                "\nVideo completo generado en {:.1}s: {}",
+                started.elapsed().as_secs_f64(),
+                out_mp4.display()
+            );
+            p
+        };
+
+        let timestamps = cue::format_youtube_timestamps(&plan);
+        println!("\nTracklist:\n{}", timestamps);
+
+        if youtube_upload {
+            let item = build_full_album_upload_item(
+                &out_mp4,
+                cue_sheet,
+                album_meta,
+                &timestamps,
+                desc_tpl,
+            );
+            let pl_title_opt = playlist_meta_tuple(youtube_playlist, album_meta);
+            let summary = youtube::upload_videos_batch(
+                &[item],
+                &cfg.output,
+                client_secret,
+                yt_privacy,
+                pl_title_opt.as_ref().map(|(t, d)| (t.as_str(), d.as_str())),
+                None,
+                |line| println!("{}", line),
+                |done, total, msg| println!("YouTube [{}/{}] {}", done, total, msg),
+            )?;
+            println!(
+                "\nResumen YouTube: {} subido(s), {} omitido(s), {} error(es).",
+                summary.uploaded_count, summary.skipped_count, summary.err_count
+            );
+            if summary.err_count > 0 {
+                bail!("Finalizó con {} error(es).", summary.err_count);
+            }
+        }
+        return Ok(());
+    }
 
     let mut all_pairs = Vec::with_capacity(cue_sheet.tracks.len());
     let mut pending = Vec::new();

@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
-use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{BOOL, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateFontW, DeleteObject, GetDC, GetDeviceCaps, GetStockObject, ReleaseDC, SetBkColor,
     SetBkMode, COLOR_BTNFACE, HBRUSH, HFONT, HGDIOBJ, LOGPIXELSX, TRANSPARENT, WHITE_BRUSH,
@@ -21,7 +21,12 @@ use windows_sys::Win32::System::ApplicationInstallationAndServicing::{
 use windows_sys::Win32::System::Com::{
     CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
 };
+use windows_sys::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
+use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
 use windows_sys::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
@@ -55,7 +60,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::cue::{
-    cue_track_output_stem, format_tracks_for_review, parse_cue_file, parse_tracks_from_review,
+    build_tracks_from_directory, compute_timeline, cue_track_output_stem,
+    format_tracks_for_review, format_youtube_timestamps, parse_cue_file, parse_tracks_from_review,
     resolve_cue_for_input, split_cue_to_mp3, CueSheet, CueTrack,
 };
 use crate::vgmdb::{lookup_album, AlbumMetadata};
@@ -64,10 +70,11 @@ use crate::youtube::{
     PrivacyStatus,
 };
 use crate::{
-    build_upload_items, build_upload_items_for_cue, collect_mp3_files, default_jobs, find_ffmpeg,
-    has_extension, output_path_for, render_cue_track_to_mp4, render_single, resolve_image,
-    FitMode, RenderConfig, RenderJob, DEFAULT_DESC_TEMPLATE, DEFAULT_TITLE_TEMPLATE,
-    IMAGE_EXTENSIONS,
+    build_full_album_upload_item, build_upload_items, build_upload_items_for_cue,
+    collect_mp3_files, default_jobs, find_ffmpeg, full_album_output_path, has_extension,
+    output_path_for, render_cue_track_to_mp4, render_full_album_to_mp4, render_single,
+    resolve_image, FitMode, RenderConfig, RenderJob, DEFAULT_DESC_TEMPLATE,
+    DEFAULT_TITLE_TEMPLATE, IMAGE_EXTENSIONS,
 };
 
 const ACTCTX_FLAG_RESOURCE_NAME_VALID: u32 = 0x0000_0008;
@@ -93,6 +100,8 @@ const ID_BTN_BROWSE_SECRET: usize = 110;
 const ID_BTN_CONNECT_YT: usize = 111;
 const ID_BTN_UPLOAD_ONLY: usize = 112;
 const ID_BTN_SPLIT_CUE_MP3: usize = 113;
+const ID_BTN_COPY_TIMESTAMPS: usize = 114;
+const ID_CHK_FULL_ALBUM: usize = 115;
 
 const RESOLUTIONS: &[(&str, (u32, u32))] = &[
     ("1920x1080 (Full HD 16:9)", (1920, 1080)),
@@ -168,6 +177,7 @@ struct AppSettings {
     overwrite: bool,
     yt_upload_after: bool,
     yt_playlist: bool,
+    full_album: bool,
 }
 
 impl Default for AppSettings {
@@ -198,6 +208,7 @@ impl Default for AppSettings {
             overwrite: false,
             yt_upload_after: false,
             yt_playlist: false,
+            full_album: false,
         }
     }
 }
@@ -246,6 +257,8 @@ struct GuiState {
     edit_composers: HWND,
     edit_title_tpl: HWND,
     edit_desc_tpl: HWND,
+    chk_full_album: HWND,
+    btn_copy_timestamps: HWND,
     lbl_cue_info: HWND,
     edit_cue_tracks: HWND,
     edit_client_secret: HWND,
@@ -301,6 +314,8 @@ impl GuiState {
             edit_composers: null_mut(),
             edit_title_tpl: null_mut(),
             edit_desc_tpl: null_mut(),
+            chk_full_album: null_mut(),
+            btn_copy_timestamps: null_mut(),
             lbl_cue_info: null_mut(),
             edit_cue_tracks: null_mut(),
             edit_client_secret: null_mut(),
@@ -331,7 +346,7 @@ impl GuiState {
         (logical_px * self.dpi + 48) / 96
     }
 
-    fn editable_controls(&self) -> [HWND; 31] {
+    fn editable_controls(&self) -> [HWND; 33] {
         [
             self.edit_input,
             self.btn_browse_input_dir,
@@ -355,6 +370,8 @@ impl GuiState {
             self.edit_composers,
             self.edit_title_tpl,
             self.edit_desc_tpl,
+            self.chk_full_album,
+            self.btn_copy_timestamps,
             self.edit_cue_tracks,
             self.edit_client_secret,
             self.btn_browse_secret,
@@ -407,6 +424,7 @@ fn save_settings(state: &GuiState) {
         overwrite: is_checked(state.chk_overwrite),
         yt_upload_after: is_checked(state.chk_yt_upload_after),
         yt_playlist: is_checked(state.chk_yt_playlist),
+        full_album: is_checked(state.chk_full_album),
     };
     if let Ok(json) = serde_json::to_string_pretty(&s) {
         let _ = fs::write(settings_file_path(), json);
@@ -733,9 +751,79 @@ fn clear_cue_ui(state: &mut GuiState) {
     state.cue_sheet = None;
     set_window_text(
         state.lbl_cue_info,
-        "Sin archivo .cue cargado (elegí o arrastrá un .cue o .flac con su .cue)",
+        "Sin archivo .cue cargado (elegí o arrastrá un .cue, .flac o carpeta con MP3s)",
     );
     set_window_text(state.edit_cue_tracks, "");
+}
+
+fn copy_text_to_clipboard(hwnd: HWND, text: &str) -> Result<()> {
+    let wide = to_wide(text);
+    let byte_len = wide.len() * std::mem::size_of::<u16>();
+
+    unsafe {
+        if OpenClipboard(hwnd) == 0 {
+            bail!("No se pudo abrir el portapapeles de Windows.");
+        }
+    }
+
+    let hmem = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_len) };
+    if hmem.is_null() {
+        unsafe {
+            CloseClipboard();
+        }
+        bail!("Sin memoria al copiar al portapapeles.");
+    }
+
+    let ptr = unsafe { GlobalLock(hmem) } as *mut u16;
+    if ptr.is_null() {
+        unsafe {
+            CloseClipboard();
+        }
+        bail!("No se pudo bloquear la memoria del portapapeles.");
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+        GlobalUnlock(hmem);
+        EmptyClipboard();
+        let res = SetClipboardData(CF_UNICODETEXT as u32, hmem as HANDLE);
+        CloseClipboard();
+        if res.is_null() {
+            bail!("Windows rechazó los datos en el portapapeles.");
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_loaded_cue_to_ui(
+    state: &mut GuiState,
+    label: &str,
+    cue: CueSheet,
+    populate_album_fields: bool,
+) {
+    set_window_text(state.lbl_cue_info, label);
+    set_window_text(state.edit_cue_tracks, &format_tracks_for_review(&cue.tracks));
+
+    if populate_album_fields {
+        if get_window_text(state.edit_album).trim().is_empty() {
+            if let Some(ref alb) = cue.album_title {
+                set_window_text(state.edit_album, alb);
+            }
+        }
+        if get_window_text(state.edit_composers).trim().is_empty() {
+            if let Some(ref perf) = cue.performer {
+                set_window_text(state.edit_composers, perf);
+            }
+        }
+        if get_window_text(state.edit_vgmdb_code).trim().is_empty() {
+            if let Some(ref cat) = cue.catalog {
+                set_window_text(state.edit_vgmdb_code, cat);
+            }
+        }
+    }
+
+    state.cue_sheet = Some(cue);
 }
 
 fn try_load_cue_for_path(state: &mut GuiState, path: &Path, populate_album_fields: bool) {
@@ -752,34 +840,11 @@ fn try_load_cue_for_path(state: &mut GuiState, path: &Path, populate_album_field
                 .unwrap_or_else(|| OsStr::new("?"))
                 .to_string_lossy()
                 .to_string();
-            set_window_text(
-                state.lbl_cue_info,
-                &format!(
-                    "CUE: {} ({} pistas) — revisá o editá los títulos abajo:",
-                    audio_name,
-                    cue.tracks.len()
-                ),
+            let label = format!(
+                "CUE: {} ({} pistas) — revisá o editá los títulos abajo:",
+                audio_name,
+                cue.tracks.len()
             );
-            set_window_text(state.edit_cue_tracks, &format_tracks_for_review(&cue.tracks));
-
-            if populate_album_fields {
-                if get_window_text(state.edit_album).trim().is_empty() {
-                    if let Some(ref alb) = cue.album_title {
-                        set_window_text(state.edit_album, alb);
-                    }
-                }
-                if get_window_text(state.edit_composers).trim().is_empty() {
-                    if let Some(ref perf) = cue.performer {
-                        set_window_text(state.edit_composers, perf);
-                    }
-                }
-                if get_window_text(state.edit_vgmdb_code).trim().is_empty() {
-                    if let Some(ref cat) = cue.catalog {
-                        set_window_text(state.edit_vgmdb_code, cat);
-                    }
-                }
-            }
-
             append_log(
                 state.edit_log,
                 &format!(
@@ -789,11 +854,58 @@ fn try_load_cue_for_path(state: &mut GuiState, path: &Path, populate_album_field
                     cue.tracks.len()
                 ),
             );
-            state.cue_sheet = Some(cue);
+            apply_loaded_cue_to_ui(state, &label, cue, populate_album_fields);
         }
         Err(err) => {
             clear_cue_ui(state);
             append_log(state.edit_log, &format!("[CUE AVISO] {:#}", err));
+        }
+    }
+}
+
+fn try_load_directory_into_review(
+    state: &mut GuiState,
+    dir: &Path,
+    populate_album_fields: bool,
+    log_errors: bool,
+) {
+    let out_raw = get_window_text(state.edit_output).trim().to_string();
+    let output_dir = if out_raw.is_empty() {
+        dir.join("output")
+    } else {
+        PathBuf::from(out_raw)
+    };
+    let recursive = is_checked(state.chk_recursive);
+    let ffmpeg = find_ffmpeg(None).ok();
+
+    match build_tracks_from_directory(
+        dir,
+        &output_dir,
+        recursive,
+        state.album_meta.as_ref(),
+        ffmpeg.as_deref(),
+    ) {
+        Ok(cue) => {
+            let count = cue.tracks.len();
+            let label = format!(
+                "Álbum completo en carpeta: {} pista(s) — revisá o editá los títulos abajo:",
+                count
+            );
+            append_log(
+                state.edit_log,
+                &format!(
+                    "[ÁLBUM] Cargadas {} pista(s) desde '{}'.",
+                    count,
+                    dir.display()
+                ),
+            );
+            apply_loaded_cue_to_ui(state, &label, cue, populate_album_fields);
+        }
+        Err(err) => {
+            clear_cue_ui(state);
+            if log_errors {
+                append_log(state.edit_log, &format!("[ÁLBUM AVISO] {:#}", err));
+            }
         }
     }
 }
@@ -1378,28 +1490,57 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         f_small,
     );
 
-    // Grupo Pistas CUE / FLAC (revisión en pantalla)
+    // Grupo Pistas CUE / FLAC / Álbum completo (revisión en pantalla)
     create_child(
         hwnd,
         "BUTTON",
-        "Pistas del CUE / FLAC (revisar o editar títulos antes de dividir o renderizar)",
+        "Pistas CUE / FLAC o Álbum completo (revisar o editar títulos)",
         BS_GROUPBOX as u32 | WS_GROUP,
         0,
         state.px(16),
         state.px(378),
         state.px(868),
-        state.px(112),
+        state.px(122),
         0,
         f_bold,
     );
+    state.chk_full_album = create_child(
+        hwnd,
+        "BUTTON",
+        "Álbum completo (1 solo video con timestamps / capítulos)",
+        BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+        0,
+        state.px(28),
+        state.px(395),
+        state.px(420),
+        state.px(20),
+        ID_CHK_FULL_ALBUM,
+        f_bold,
+    );
+    set_checked(state.chk_full_album, saved.full_album);
+
+    state.btn_copy_timestamps = create_child(
+        hwnd,
+        "BUTTON",
+        "📋 Copiar Timestamps",
+        BS_PUSHBUTTON as u32 | WS_TABSTOP,
+        0,
+        state.px(690),
+        state.px(393),
+        state.px(182),
+        state.px(23),
+        ID_BTN_COPY_TIMESTAMPS,
+        f_reg,
+    );
+
     state.lbl_cue_info = create_child(
         hwnd,
         "STATIC",
-        "Sin archivo .cue cargado (elegí o arrastrá un .cue o .flac con su .cue)",
+        "Sin archivo .cue cargado (elegí o arrastrá un .cue, .flac o carpeta con MP3s)",
         0,
         0,
         state.px(28),
-        state.px(396),
+        state.px(418),
         state.px(844),
         state.px(16),
         0,
@@ -1418,9 +1559,9 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
             | WS_BORDER,
         WS_EX_CLIENTEDGE,
         state.px(28),
-        state.px(414),
+        state.px(436),
         state.px(844),
-        state.px(68),
+        state.px(58),
         0,
         f_small,
     );
@@ -1433,7 +1574,7 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         BS_GROUPBOX as u32 | WS_GROUP,
         0,
         state.px(16),
-        state.px(496),
+        state.px(506),
         state.px(868),
         state.px(80),
         0,
@@ -1447,7 +1588,7 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         0,
         0,
         state.px(28),
-        state.px(518),
+        state.px(528),
         state.px(88),
         state.px(18),
         0,
@@ -1460,7 +1601,7 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         ES_AUTOHSCROLL as u32 | WS_TABSTOP | WS_BORDER,
         WS_EX_CLIENTEDGE,
         state.px(120),
-        state.px(515),
+        state.px(525),
         state.px(460),
         state.px(23),
         0,
@@ -1473,7 +1614,7 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         BS_PUSHBUTTON as u32 | WS_TABSTOP,
         0,
         state.px(586),
-        state.px(515),
+        state.px(525),
         state.px(116),
         state.px(23),
         ID_BTN_BROWSE_SECRET,
@@ -1486,7 +1627,7 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         BS_PUSHBUTTON as u32 | WS_TABSTOP,
         0,
         state.px(708),
-        state.px(515),
+        state.px(525),
         state.px(164),
         state.px(23),
         ID_BTN_CONNECT_YT,
@@ -1500,7 +1641,7 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         0,
         0,
         state.px(28),
-        state.px(548),
+        state.px(558),
         state.px(88),
         state.px(18),
         0,
@@ -1513,7 +1654,7 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         CBS_DROPDOWNLIST as u32 | WS_TABSTOP | WS_VSCROLL,
         0,
         state.px(120),
-        state.px(545),
+        state.px(555),
         state.px(174),
         state.px(200),
         0,
@@ -1528,7 +1669,7 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
         0,
         state.px(306),
-        state.px(547),
+        state.px(557),
         state.px(236),
         state.px(20),
         0,
@@ -1543,7 +1684,7 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
         0,
         state.px(550),
-        state.px(547),
+        state.px(557),
         state.px(174),
         state.px(20),
         0,
@@ -1558,7 +1699,7 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         0,
         0,
         state.px(734),
-        state.px(548),
+        state.px(558),
         state.px(138),
         state.px(18),
         0,
@@ -1573,7 +1714,7 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         BS_DEFPUSHBUTTON as u32 | WS_TABSTOP,
         0,
         state.px(16),
-        state.px(584),
+        state.px(594),
         state.px(185),
         state.px(30),
         ID_BTN_START,
@@ -1586,7 +1727,7 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         BS_PUSHBUTTON as u32 | WS_TABSTOP,
         0,
         state.px(209),
-        state.px(584),
+        state.px(594),
         state.px(176),
         state.px(30),
         ID_BTN_SPLIT_CUE_MP3,
@@ -1599,7 +1740,7 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         BS_PUSHBUTTON as u32 | WS_TABSTOP,
         0,
         state.px(393),
-        state.px(584),
+        state.px(594),
         state.px(180),
         state.px(30),
         ID_BTN_UPLOAD_ONLY,
@@ -1612,7 +1753,7 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         BS_PUSHBUTTON as u32 | WS_TABSTOP,
         0,
         state.px(581),
-        state.px(584),
+        state.px(594),
         state.px(102),
         state.px(30),
         ID_BTN_CANCEL,
@@ -1629,7 +1770,7 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         BS_PUSHBUTTON as u32 | WS_TABSTOP,
         0,
         state.px(691),
-        state.px(584),
+        state.px(594),
         state.px(193),
         state.px(30),
         ID_BTN_OPEN_OUTPUT,
@@ -1644,7 +1785,7 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         0,
         0,
         state.px(16),
-        state.px(622),
+        state.px(632),
         state.px(868),
         state.px(16),
         0,
@@ -1657,7 +1798,7 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         0,
         0,
         state.px(16),
-        state.px(642),
+        state.px(652),
         state.px(868),
         state.px(18),
         0,
@@ -1670,9 +1811,9 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32 | ES_READONLY as u32 | WS_VSCROLL | WS_BORDER,
         WS_EX_CLIENTEDGE,
         state.px(16),
-        state.px(664),
+        state.px(674),
         state.px(868),
-        state.px(66),
+        state.px(58),
         0,
         f_small,
     );
@@ -1715,6 +1856,8 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
     let init_path = PathBuf::from(&init_input);
     if init_path.is_file() {
         try_load_cue_for_path(state, &init_path, false);
+    } else if init_path.is_dir() && saved.full_album {
+        try_load_directory_into_review(state, &init_path, false, false);
     }
 }
 
@@ -1901,23 +2044,39 @@ fn read_gui_config(state: &GuiState) -> Result<RenderConfig> {
     })
 }
 
-fn active_cue_with_reviewed_tracks(state: &mut GuiState, input: &Path) -> Result<Option<(CueSheet, Vec<CueTrack>)>> {
-    if state.cue_sheet.is_none() && input.is_file() {
-        try_load_cue_for_path(state, input, true);
+fn parse_review_tracks(state: &GuiState, cue: &CueSheet) -> Result<Vec<CueTrack>> {
+    let review_text = get_window_text(state.edit_cue_tracks);
+    if review_text.trim().is_empty() {
+        Ok(cue.tracks.clone())
+    } else {
+        parse_tracks_from_review(&review_text, &cue.tracks)
+    }
+}
+
+fn active_cue_with_reviewed_tracks(
+    state: &mut GuiState,
+    input: &Path,
+) -> Result<Option<(CueSheet, Vec<CueTrack>)>> {
+    let full_album = is_checked(state.chk_full_album);
+
+    if state.cue_sheet.is_none() {
+        if input.is_file() {
+            try_load_cue_for_path(state, input, true);
+        } else if input.is_dir() && full_album {
+            try_load_directory_into_review(state, input, true, false);
+        }
     }
 
-    let Some(ref cue) = state.cue_sheet else {
+    let Some(cue) = state.cue_sheet.clone() else {
         return Ok(None);
     };
 
-    let review_text = get_window_text(state.edit_cue_tracks);
-    let reviewed = if review_text.trim().is_empty() {
-        cue.tracks.clone()
-    } else {
-        parse_tracks_from_review(&review_text, &cue.tracks)?
-    };
+    if cue.cue_path.is_dir() && !full_album {
+        return Ok(None);
+    }
 
-    Ok(Some((cue.clone(), reviewed)))
+    let reviewed = parse_review_tracks(state, &cue)?;
+    Ok(Some((cue, reviewed)))
 }
 
 fn start_vgmdb_search(hwnd: HWND, state: &mut GuiState) {
@@ -2016,18 +2175,29 @@ fn start_render(hwnd: HWND, state: &mut GuiState) {
         }
     };
 
+    let full_album = is_checked(state.chk_full_album);
     let cue_job = match active_cue_with_reviewed_tracks(state, &cfg.input) {
         Ok(c) => c,
         Err(err) => {
             show_msg_box(
                 hwnd,
-                "Error en lista de pistas CUE",
+                "Error en lista de pistas",
                 &format!("{:#}", err),
                 MB_OK | MB_ICONWARNING,
             );
             return;
         }
     };
+
+    if full_album && cue_job.is_none() {
+        show_msg_box(
+            hwnd,
+            "Sin pistas para álbum completo",
+            "Para renderizar 1 video completo con timestamps, elegí un archivo .cue/.flac o una carpeta con archivos MP3.",
+            MB_OK | MB_ICONWARNING,
+        );
+        return;
+    }
 
     let upload_after = is_checked(state.chk_yt_upload_after);
     let upload_cfg = match read_upload_settings(state, upload_after) {
@@ -2049,13 +2219,25 @@ fn start_render(hwnd: HWND, state: &mut GuiState) {
     set_running_ui(state, true);
     send_msg(state.progress, PBM_SETRANGE32, 0, 100);
     send_msg(state.progress, PBM_SETPOS, 0, 0);
-    set_window_text(state.lbl_status, "Preparando lote...");
+    set_window_text(
+        state.lbl_status,
+        if full_album {
+            "Preparando álbum completo..."
+        } else {
+            "Preparando lote..."
+        },
+    );
     set_window_text(state.edit_log, "");
     append_log(
         state.edit_log,
         &format!(
-            "Iniciando: {}x{} | {:?} | {} fps | {} hilo(s)",
-            cfg.width, cfg.height, cfg.fit, cfg.fps, cfg.jobs
+            "Iniciando: {}x{} | {:?} | {} fps | {} hilo(s){}",
+            cfg.width,
+            cfg.height,
+            cfg.fit,
+            cfg.fps,
+            cfg.jobs,
+            if full_album { " | MODO ÁLBUM COMPLETO" } else { "" }
         ),
     );
 
@@ -2063,7 +2245,11 @@ fn start_render(hwnd: HWND, state: &mut GuiState) {
     std::thread::spawn(move || {
         let hwnd = hwnd_val as HWND;
         let summary = if let Some((cue, tracks)) = cue_job {
-            run_gui_cue_render(hwnd, &cue, &tracks, &cfg, &upload_cfg, &cancel_flag)
+            if full_album {
+                run_gui_full_album(hwnd, &cue, &tracks, &cfg, &upload_cfg, &cancel_flag)
+            } else {
+                run_gui_cue_render(hwnd, &cue, &tracks, &cfg, &upload_cfg, &cancel_flag)
+            }
         } else {
             run_gui_batch(hwnd, &cfg, &upload_cfg, &cancel_flag)
         };
@@ -2110,6 +2296,16 @@ fn start_split_cue_mp3(hwnd: HWND, state: &mut GuiState) {
             return;
         }
     };
+
+    if cue_job.0.cue_path.is_dir() || !cue_job.0.audio_path.is_file() {
+        show_msg_box(
+            hwnd,
+            "Extraer MP3s requiere un CUE",
+            "Para extraer MP3s individuales, cargá un archivo .cue (o .flac junto a su .cue).",
+            MB_OK | MB_ICONWARNING,
+        );
+        return;
+    }
 
     save_settings(state);
     let album_ovr = {
@@ -2223,6 +2419,7 @@ fn start_upload_only(hwnd: HWND, state: &mut GuiState) {
 
     let input_path = PathBuf::from(get_window_text(state.edit_input).trim());
     let recursive = is_checked(state.chk_recursive);
+    let full_album = is_checked(state.chk_full_album);
     let cue_job = active_cue_with_reviewed_tracks(state, &input_path).ok().flatten();
 
     save_settings(state);
@@ -2242,6 +2439,7 @@ fn start_upload_only(hwnd: HWND, state: &mut GuiState) {
             &input_path,
             &output_dir,
             recursive,
+            full_album,
             cue_job,
             &upload_cfg,
             &cancel_flag,
@@ -2342,12 +2540,33 @@ fn run_gui_upload_only(
     input_path: &Path,
     output_dir: &Path,
     recursive: bool,
+    full_album: bool,
     cue_job: Option<(CueSheet, Vec<CueTrack>)>,
     upload_cfg: &UploadSettings,
     cancel_flag: &AtomicBool,
 ) -> BatchSummary {
     let started = Instant::now();
-    let items = if let Some((ref cue, ref tracks)) = cue_job {
+    let items = if full_album {
+        if let Some((ref cue, ref tracks)) = cue_job {
+            let out_mp4 = full_album_output_path(output_dir, cue, upload_cfg.album_meta.as_ref());
+            if out_mp4.is_file() {
+                let ffmpeg = find_ffmpeg(None).ok();
+                let plan = compute_timeline(tracks, &cue.audio_path, ffmpeg.as_deref());
+                let ts_block = format_youtube_timestamps(&plan);
+                vec![build_full_album_upload_item(
+                    &out_mp4,
+                    cue,
+                    upload_cfg.album_meta.as_ref(),
+                    &ts_block,
+                    &upload_cfg.desc_template,
+                )]
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        }
+    } else if let Some((ref cue, ref tracks)) = cue_job {
         let cue_pairs: Vec<(CueTrack, PathBuf)> = tracks
             .iter()
             .map(|tr| {
@@ -2420,6 +2639,203 @@ fn run_gui_upload_only(
             err_count: 1,
             error_message: Some(format!("{:#}", err)),
         },
+    }
+}
+
+fn run_gui_full_album(
+    hwnd: HWND,
+    cue: &CueSheet,
+    tracks: &[CueTrack],
+    cfg: &RenderConfig,
+    upload_cfg: &UploadSettings,
+    cancel_flag: &AtomicBool,
+) -> BatchSummary {
+    let started = Instant::now();
+    let ffmpeg = match find_ffmpeg(cfg.ffmpeg_path.as_deref()) {
+        Ok(f) => f,
+        Err(err) => {
+            return BatchSummary {
+                headline: String::new(),
+                err_count: 1,
+                error_message: Some(format!("{:#}", err)),
+            };
+        }
+    };
+
+    let base_dir = if cue.cue_path.is_dir() {
+        cue.cue_path.as_path()
+    } else {
+        cue.cue_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+    };
+    let audio_hint = tracks
+        .first()
+        .and_then(|t| t.source_audio.as_deref())
+        .unwrap_or(&cue.audio_path);
+
+    let Some(image_path) = resolve_image(audio_hint, cfg.image.as_deref(), base_dir) else {
+        return BatchSummary {
+            headline: String::new(),
+            err_count: 1,
+            error_message: Some(
+                "No se encontró imagen asociada (elegí una imagen o colocá cover.jpg/portada.png junto al audio)."
+                    .to_string(),
+            ),
+        };
+    };
+
+    if let Err(err) = fs::create_dir_all(&cfg.output) {
+        return BatchSummary {
+            headline: String::new(),
+            err_count: 1,
+            error_message: Some(format!(
+                "No se pudo crear la carpeta de salida: {}",
+                err
+            )),
+        };
+    }
+
+    let out_mp4 = full_album_output_path(&cfg.output, cue, upload_cfg.album_meta.as_ref());
+    let album_title = upload_cfg
+        .album_meta
+        .as_ref()
+        .map(|a| a.album_title.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .or(cue.album_title.as_deref());
+
+    unsafe {
+        PostMessageW(hwnd, WM_APP_PROGRESS, 0, 1);
+    }
+
+    let mut render_ok = 0usize;
+    let mut skipped_count = 0usize;
+
+    let plan = if out_mp4.exists() && !cfg.overwrite {
+        skipped_count = 1;
+        post_boxed(
+            hwnd,
+            WM_APP_LOG,
+            0,
+            format!("[OMITIDO] Ya existe '{}'.", out_mp4.display()),
+        );
+        compute_timeline(tracks, &cue.audio_path, Some(&ffmpeg))
+    } else {
+        post_boxed(
+            hwnd,
+            WM_APP_STATUS,
+            0,
+            format!("Renderizando álbum completo ({} pista(s))...", tracks.len()),
+        );
+        post_boxed(
+            hwnd,
+            WM_APP_LOG,
+            0,
+            format!(
+                "Renderizando álbum completo ({} pistas) -> '{}' (imagen 100% fija)...",
+                tracks.len(),
+                out_mp4.display()
+            ),
+        );
+        match render_full_album_to_mp4(
+            &ffmpeg,
+            tracks,
+            &cue.audio_path,
+            album_title,
+            &image_path,
+            &out_mp4,
+            cfg,
+        ) {
+            Ok(plan) => {
+                render_ok = 1;
+                post_boxed(
+                    hwnd,
+                    WM_APP_LOG,
+                    0,
+                    format!("[OK] Álbum completo guardado en {}", out_mp4.display()),
+                );
+                plan
+            }
+            Err(err) => {
+                return BatchSummary {
+                    headline: String::new(),
+                    err_count: 1,
+                    error_message: Some(format!("{:#}", err)),
+                };
+            }
+        }
+    };
+
+    unsafe {
+        PostMessageW(hwnd, WM_APP_PROGRESS, 1, 1);
+    }
+
+    let ts_block = format_youtube_timestamps(&plan);
+    post_boxed(
+        hwnd,
+        WM_APP_LOG,
+        0,
+        "[TIMESTAMPS PARA YOUTUBE]:".to_string(),
+    );
+    for line in ts_block.lines() {
+        post_boxed(hwnd, WM_APP_LOG, 0, line.to_string());
+    }
+
+    let mut total_errs = 0usize;
+    let mut yt_note = String::new();
+    if upload_cfg.upload_after_render && !cancel_flag.load(Ordering::Relaxed) {
+        let item = build_full_album_upload_item(
+            &out_mp4,
+            cue,
+            upload_cfg.album_meta.as_ref(),
+            &ts_block,
+            &upload_cfg.desc_template,
+        );
+        post_boxed(
+            hwnd,
+            WM_APP_LOG,
+            0,
+            format!("Subiendo álbum completo '{}' a YouTube...", item.title),
+        );
+        match execute_youtube_upload_items(
+            hwnd,
+            &[item],
+            &cfg.output,
+            upload_cfg,
+            cancel_flag,
+        ) {
+            Ok(yt) => {
+                total_errs += yt.err_count;
+                yt_note = format!(
+                    " | YouTube: {} subido(s), {} omitido(s), {} error(es)",
+                    yt.uploaded_count, yt.skipped_count, yt.err_count
+                );
+            }
+            Err(err) => {
+                total_errs += 1;
+                post_boxed(
+                    hwnd,
+                    WM_APP_LOG,
+                    0,
+                    format!("[YOUTUBE ERROR] {:#}", err),
+                );
+                yt_note = " | Error en subida a YouTube".to_string();
+            }
+        }
+    }
+
+    BatchSummary {
+        headline: format!(
+            "Álbum completo finalizado en {:.1}s: {} renderizado(s), {} omitido(s), {} capítulo(s){}.",
+            started.elapsed().as_secs_f64(),
+            render_ok,
+            skipped_count,
+            plan.chapters.len(),
+            yt_note
+        ),
+        err_count: total_errs,
+        error_message: None,
     }
 }
 
@@ -2542,7 +2958,7 @@ fn run_gui_cue_render(
 
                 match render_cue_track_to_mp4(
                     &ffmpeg,
-                    &cue.audio_path,
+                    tr.source_audio.as_deref().unwrap_or(&cue.audio_path),
                     tr,
                     &image_path,
                     out_mp4,
@@ -2926,6 +3342,8 @@ fn handle_drop_files(hwnd: HWND, state: &mut GuiState, hdrop: HDROP) {
             }
             if path.is_file() && has_extension(&path, &["cue", "flac", "wav", "ape", "wv"]) {
                 try_load_cue_for_path(state, &path, true);
+            } else if path.is_dir() && is_checked(state.chk_full_album) {
+                try_load_directory_into_review(state, &path, true, true);
             } else {
                 clear_cue_ui(state);
             }
@@ -2973,7 +3391,11 @@ fn handle_command(hwnd: HWND, state: &mut GuiState, cmd_id: usize) {
                 if get_window_text(state.edit_output).trim().is_empty() {
                     set_window_text(state.edit_output, &folder.join("output").to_string_lossy());
                 }
-                clear_cue_ui(state);
+                if is_checked(state.chk_full_album) {
+                    try_load_directory_into_review(state, &folder, true, true);
+                } else {
+                    clear_cue_ui(state);
+                }
                 save_settings(state);
             }
         }
@@ -3054,6 +3476,107 @@ fn handle_command(hwnd: HWND, state: &mut GuiState, cmd_id: usize) {
         ID_BTN_CONNECT_YT => start_youtube_connect(hwnd, state),
         ID_BTN_START => start_render(hwnd, state),
         ID_BTN_SPLIT_CUE_MP3 => start_split_cue_mp3(hwnd, state),
+        ID_CHK_FULL_ALBUM => {
+            let input_path = PathBuf::from(get_window_text(state.edit_input).trim());
+            if is_checked(state.chk_full_album) {
+                if input_path.is_dir() && state.cue_sheet.is_none() {
+                    try_load_directory_into_review(state, &input_path, true, true);
+                }
+            } else if state
+                .cue_sheet
+                .as_ref()
+                .is_some_and(|c| c.cue_path.is_dir())
+            {
+                clear_cue_ui(state);
+            }
+            save_settings(state);
+        }
+        ID_BTN_COPY_TIMESTAMPS => {
+            if state.is_running {
+                return;
+            }
+            let input_path = PathBuf::from(get_window_text(state.edit_input).trim());
+            if state.cue_sheet.is_none() {
+                if input_path.is_file() {
+                    try_load_cue_for_path(state, &input_path, true);
+                } else if input_path.is_dir() {
+                    try_load_directory_into_review(state, &input_path, true, true);
+                }
+            }
+
+            let Some(cue) = state.cue_sheet.clone() else {
+                show_msg_box(
+                    hwnd,
+                    "Sin pistas para timestamps",
+                    "Cargá un .cue/.flac o elegí una carpeta con archivos MP3 para generar los timestamps.",
+                    MB_OK | MB_ICONWARNING,
+                );
+                return;
+            };
+
+            let tracks = match parse_review_tracks(state, &cue) {
+                Ok(t) => t,
+                Err(err) => {
+                    show_msg_box(
+                        hwnd,
+                        "Error en lista de pistas",
+                        &format!("{:#}", err),
+                        MB_OK | MB_ICONWARNING,
+                    );
+                    return;
+                }
+            };
+
+            let ffmpeg = find_ffmpeg(None).ok();
+            let plan = compute_timeline(&tracks, &cue.audio_path, ffmpeg.as_deref());
+            let ts_block = format_youtube_timestamps(&plan);
+            if ts_block.trim().is_empty() {
+                show_msg_box(
+                    hwnd,
+                    "Sin timestamps",
+                    "No se pudieron calcular los timestamps.",
+                    MB_OK | MB_ICONWARNING,
+                );
+                return;
+            }
+
+            let clip_text = ts_block.replace('\n', "\r\n");
+            match copy_text_to_clipboard(hwnd, &clip_text) {
+                Ok(()) => {
+                    append_log(
+                        state.edit_log,
+                        &format!("[TIMESTAMPS COPIADOS] {} capítulo(s):", plan.chapters.len()),
+                    );
+                    for line in ts_block.lines() {
+                        append_log(state.edit_log, &format!("  {}", line));
+                    }
+                    set_window_text(
+                        state.lbl_status,
+                        &format!(
+                            "Timestamps copiados al portapapeles ({} capítulos).",
+                            plan.chapters.len()
+                        ),
+                    );
+                    show_msg_box(
+                        hwnd,
+                        "Timestamps copiados",
+                        &format!(
+                            "Se copiaron {} timestamps al portapapeles.\nPodés pegarlos en la descripción de YouTube con Ctrl+V (también quedaron visibles en el log).",
+                            plan.chapters.len()
+                        ),
+                        MB_OK | MB_ICONINFORMATION,
+                    );
+                }
+                Err(err) => {
+                    show_msg_box(
+                        hwnd,
+                        "Error al copiar",
+                        &format!("{:#}", err),
+                        MB_OK | MB_ICONERROR,
+                    );
+                }
+            }
+        }
         ID_BTN_UPLOAD_ONLY => start_upload_only(hwnd, state),
         ID_BTN_CANCEL => {
             if state.is_running {

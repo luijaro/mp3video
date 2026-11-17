@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -6,8 +7,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use walkdir::WalkDir;
 
-use crate::{has_extension, new_hidden_command};
+use crate::vgmdb::{match_track_for_file, read_mp3_tags, AlbumMetadata};
+use crate::{collect_mp3_files, find_ffprobe, has_extension, new_hidden_command};
 
 pub(crate) const SINGLE_IMAGE_AUDIO_EXTS: &[&str] = &["flac", "wav", "ape", "wv", "m4a", "mp3"];
 pub(crate) const CUE_AUDIO_EXTS: &[&str] = &["flac", "wav", "ape", "wv"];
@@ -19,6 +22,8 @@ pub(crate) struct CueTrack {
     pub performer: Option<String>,
     pub start_secs: f64,
     pub end_secs: Option<f64>,
+    #[serde(default)]
+    pub source_audio: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,11 +37,24 @@ pub(crate) struct CueSheet {
     pub tracks: Vec<CueTrack>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ChapterEntry {
+    pub title: String,
+    pub start_secs: f64,
+    pub end_secs: f64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TimelinePlan {
+    pub single_direct_audio: Option<PathBuf>,
+    pub chapters: Vec<ChapterEntry>,
+    pub total_duration_secs: f64,
+}
+
 fn decode_cue_bytes(bytes: &[u8]) -> String {
     if let Ok(s) = std::str::from_utf8(bytes) {
         return s.trim_start_matches('\u{feff}').to_string();
     }
-    // Respaldo para .cue guardados en ANSI / Windows-1252
     bytes
         .iter()
         .map(|&b| match b {
@@ -120,7 +138,6 @@ fn resolve_audio_file(cue_path: &Path, file_ref: Option<&str>) -> Result<PathBuf
         }
     }
 
-    // Respaldo: si hay un único archivo de audio lossless en la carpeta
     if let Ok(entries) = fs::read_dir(cue_dir) {
         let mut found: Option<PathBuf> = None;
         let mut multiple = false;
@@ -326,6 +343,8 @@ pub(crate) fn parse_cue_file(cue_path: &Path) -> Result<CueSheet> {
         bail!("El archivo CUE '{}' no contiene pistas (TRACK).", cue_path.display());
     }
 
+    let audio_path = resolve_audio_file(cue_path, file_ref.as_deref())?;
+
     let mut tracks: Vec<CueTrack> = raw_tracks
         .into_iter()
         .filter_map(|t| {
@@ -339,6 +358,7 @@ pub(crate) fn parse_cue_file(cue_path: &Path) -> Result<CueSheet> {
                 performer: t.performer,
                 start_secs,
                 end_secs: None,
+                source_audio: Some(audio_path.clone()),
             })
         })
         .collect();
@@ -357,8 +377,6 @@ pub(crate) fn parse_cue_file(cue_path: &Path) -> Result<CueSheet> {
         }
     }
 
-    let audio_path = resolve_audio_file(cue_path, file_ref.as_deref())?;
-
     Ok(CueSheet {
         cue_path: cue_path.to_path_buf(),
         audio_path,
@@ -366,6 +384,165 @@ pub(crate) fn parse_cue_file(cue_path: &Path) -> Result<CueSheet> {
         performer: album_performer,
         catalog,
         date,
+        tracks,
+    })
+}
+
+pub(crate) fn probe_audio_duration(audio_path: &Path, ffmpeg_path: Option<&Path>) -> Option<f64> {
+    let ffprobe = find_ffprobe(ffmpeg_path)?;
+    let out = new_hidden_command(&ffprobe)
+        .arg("-v")
+        .arg("error")
+        .arg("-show_entries")
+        .arg("format=duration")
+        .arg("-of")
+        .arg("default=noprint_wrappers=1:nokey=1")
+        .arg(audio_path)
+        .output()
+        .ok()?;
+
+    if !out.status.success() {
+        return None;
+    }
+
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|&d| d.is_finite() && d > 0.0)
+}
+
+fn clean_mp3_stem_title(stem: &str) -> String {
+    let trimmed = stem.trim();
+    let bytes = trimmed.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    if idx > 0 && idx < bytes.len() {
+        let rest = trimmed[idx..].trim_start_matches([' ', '-', '.', '_']);
+        if !rest.is_empty() {
+            return rest.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+pub(crate) fn build_tracks_from_directory(
+    dir: &Path,
+    output_dir: &Path,
+    recursive: bool,
+    album: Option<&AlbumMetadata>,
+    ffmpeg_path: Option<&Path>,
+) -> Result<CueSheet> {
+    if !dir.is_dir() {
+        bail!("La ruta '{}' no es una carpeta.", dir.display());
+    }
+
+    let max_depth = if recursive { usize::MAX } else { 1 };
+    let mut cue_files = Vec::new();
+    for entry in WalkDir::new(dir)
+        .max_depth(max_depth)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+    {
+        let p = entry.path();
+        if p.is_file() && has_extension(p, &["cue"]) {
+            cue_files.push(p.to_path_buf());
+        }
+    }
+    cue_files.sort();
+
+    if !cue_files.is_empty() {
+        let mut first_sheet: Option<CueSheet> = None;
+        let mut combined_tracks = Vec::new();
+        let mut seq_num = 1u32;
+
+        for cue_path in &cue_files {
+            let sheet = parse_cue_file(cue_path)?;
+            if first_sheet.is_none() {
+                first_sheet = Some(sheet.clone());
+            }
+            for mut tr in sheet.tracks {
+                tr.track_number = seq_num;
+                seq_num += 1;
+                if tr.source_audio.is_none() {
+                    tr.source_audio = Some(sheet.audio_path.clone());
+                }
+                combined_tracks.push(tr);
+            }
+        }
+
+        let mut merged = first_sheet.unwrap();
+        merged.tracks = combined_tracks;
+        return Ok(merged);
+    }
+
+    let (_, mp3_files) = collect_mp3_files(dir, output_dir, recursive)?;
+    if mp3_files.is_empty() {
+        bail!(
+            "No se encontraron archivos .cue ni .mp3 en '{}'.",
+            dir.display()
+        );
+    }
+
+    let mut tracks = Vec::with_capacity(mp3_files.len());
+    let mut first_album = None;
+    let mut first_artist = None;
+    let mut first_date = None;
+
+    for (idx, mp3) in mp3_files.iter().enumerate() {
+        let id3 = read_mp3_tags(mp3, ffmpeg_path);
+        if first_album.is_none() {
+            first_album = id3.album.clone();
+        }
+        if first_artist.is_none() {
+            first_artist = id3.composer.clone().or_else(|| id3.artist.clone());
+        }
+        if first_date.is_none() {
+            first_date = id3.date.clone();
+        }
+
+        let matched = match_track_for_file(mp3, idx, album, &id3);
+        let title = if album.is_some() || id3.title.is_some() {
+            matched.track_title
+        } else {
+            let stem = mp3
+                .file_stem()
+                .unwrap_or_else(|| OsStr::new("Track"))
+                .to_string_lossy();
+            clean_mp3_stem_title(&stem)
+        };
+
+        let dur = probe_audio_duration(mp3, ffmpeg_path);
+        tracks.push(CueTrack {
+            track_number: (idx + 1) as u32,
+            title,
+            performer: id3.composer.or(id3.artist),
+            start_secs: 0.0,
+            end_secs: dur,
+            source_audio: Some(mp3.clone()),
+        });
+    }
+
+    let fallback_audio = mp3_files[0].clone();
+    Ok(CueSheet {
+        cue_path: dir.to_path_buf(),
+        audio_path: fallback_audio,
+        album_title: album
+            .map(|a| a.album_title.clone())
+            .filter(|s| !s.is_empty())
+            .or(first_album),
+        performer: album
+            .map(|a| a.composers.join(", "))
+            .filter(|s| !s.is_empty())
+            .or(first_artist),
+        catalog: album.map(|a| a.catalog.clone()).filter(|s| !s.is_empty()),
+        date: album
+            .map(|a| a.release_date.clone())
+            .filter(|s| !s.is_empty())
+            .or(first_date),
         tracks,
     })
 }
@@ -431,6 +608,10 @@ pub(crate) fn format_tracks_for_review(tracks: &[CueTrack]) -> String {
 
 pub(crate) fn parse_tracks_from_review(text: &str, original: &[CueTrack]) -> Result<Vec<CueTrack>> {
     let mut result = Vec::new();
+    let mut count_by_num: HashMap<u32, usize> = HashMap::new();
+    for tr in original {
+        *count_by_num.entry(tr.track_number).or_insert(0) += 1;
+    }
 
     for (line_idx, raw_line) in text.lines().enumerate() {
         let line = raw_line.trim();
@@ -450,11 +631,21 @@ pub(crate) fn parse_tracks_from_review(text: &str, original: &[CueTrack]) -> Res
         let track_number: u32 = parts[0]
             .trim()
             .parse()
-            .with_context(|| format!("Número de pista inválido en línea {}: '{}'", line_idx + 1, parts[0].trim()))?;
+            .with_context(|| {
+                format!(
+                    "Número de pista inválido en línea {}: '{}'",
+                    line_idx + 1,
+                    parts[0].trim()
+                )
+            })?;
 
-        let (start_str, end_str) = parts[1]
-            .split_once('-')
-            .with_context(|| format!("Rango de tiempo inválido en línea {}: '{}'", line_idx + 1, parts[1]))?;
+        let (start_str, end_str) = parts[1].split_once('-').with_context(|| {
+            format!(
+                "Rango de tiempo inválido en línea {}: '{}'",
+                line_idx + 1,
+                parts[1]
+            )
+        })?;
 
         let start_secs = parse_timestamp(start_str)?;
         let end_trimmed = end_str.trim();
@@ -481,25 +672,212 @@ pub(crate) fn parse_tracks_from_review(text: &str, original: &[CueTrack]) -> Res
             title.to_string()
         };
 
-        let performer = original
-            .iter()
-            .find(|t| t.track_number == track_number)
-            .and_then(|t| t.performer.clone());
+        let matched_orig = if count_by_num.get(&track_number).copied().unwrap_or(0) == 1 {
+            original.iter().find(|t| t.track_number == track_number)
+        } else {
+            original
+                .get(line_idx)
+                .filter(|t| t.track_number == track_number)
+                .or_else(|| original.iter().find(|t| t.track_number == track_number))
+        };
 
         result.push(CueTrack {
             track_number,
             title: final_title,
-            performer,
+            performer: matched_orig.and_then(|t| t.performer.clone()),
             start_secs,
             end_secs,
+            source_audio: matched_orig.and_then(|t| t.source_audio.clone()),
         });
     }
 
     if result.is_empty() {
-        bail!("No hay pistas seleccionadas en la lista de revisión del CUE.");
+        bail!("No hay pistas seleccionadas en la lista de revisión.");
     }
 
     Ok(result)
+}
+
+pub(crate) fn compute_timeline(
+    tracks: &[CueTrack],
+    fallback_audio: &Path,
+    ffmpeg_path: Option<&Path>,
+) -> TimelinePlan {
+    let mut duration_cache: HashMap<PathBuf, f64> = HashMap::new();
+    let mut get_dur = |path: &Path| -> f64 {
+        if let Some(&d) = duration_cache.get(path) {
+            return d;
+        }
+        let d = probe_audio_duration(path, ffmpeg_path).unwrap_or(0.0);
+        duration_cache.insert(path.to_path_buf(), d);
+        d
+    };
+
+    let first_audio = tracks
+        .first()
+        .and_then(|t| t.source_audio.as_deref())
+        .unwrap_or(fallback_audio);
+
+    let all_same_file = !tracks.is_empty()
+        && tracks.iter().all(|t| {
+            t.source_audio.as_deref().unwrap_or(fallback_audio) == first_audio
+        });
+
+    let is_contiguous_full = all_same_file
+        && tracks[0].start_secs < 2.0
+        && tracks.last().is_some_and(|last| last.end_secs.is_none())
+        && tracks.windows(2).all(|w| {
+            w[0].end_secs
+                .is_some_and(|e| (e - w[1].start_secs).abs() < 0.05)
+        });
+
+    if is_contiguous_full {
+        let total_dur = get_dur(first_audio);
+        let mut chapters = Vec::with_capacity(tracks.len());
+        for (idx, tr) in tracks.iter().enumerate() {
+            let start = if idx == 0 { 0.0 } else { tr.start_secs };
+            let end = tr.end_secs.unwrap_or_else(|| {
+                if total_dur > start {
+                    total_dur
+                } else {
+                    start + 1.0
+                }
+            });
+            chapters.push(ChapterEntry {
+                title: tr.title.clone(),
+                start_secs: start,
+                end_secs: end.max(start + 0.1),
+            });
+        }
+        let final_dur = chapters.last().map(|c| c.end_secs).unwrap_or(total_dur);
+        return TimelinePlan {
+            single_direct_audio: Some(first_audio.to_path_buf()),
+            chapters,
+            total_duration_secs: final_dur,
+        };
+    }
+
+    let mut chapters = Vec::with_capacity(tracks.len());
+    let mut cursor = 0.0f64;
+
+    for tr in tracks {
+        let src = tr.source_audio.as_deref().unwrap_or(fallback_audio);
+        let clip_dur = match tr.end_secs {
+            Some(end) if end > tr.start_secs => end - tr.start_secs,
+            _ => {
+                let full_dur = get_dur(src);
+                if full_dur > tr.start_secs {
+                    full_dur - tr.start_secs
+                } else {
+                    1.0
+                }
+            }
+        }
+        .max(0.1);
+
+        let start = cursor;
+        let end = cursor + clip_dur;
+        cursor = end;
+        chapters.push(ChapterEntry {
+            title: tr.title.clone(),
+            start_secs: start,
+            end_secs: end,
+        });
+    }
+
+    TimelinePlan {
+        single_direct_audio: None,
+        chapters,
+        total_duration_secs: cursor,
+    }
+}
+
+pub(crate) fn format_youtube_timestamps(plan: &TimelinePlan) -> String {
+    let use_hours = plan.total_duration_secs >= 3600.0;
+    plan.chapters
+        .iter()
+        .enumerate()
+        .map(|(idx, ch)| {
+            let total_s = if idx == 0 {
+                0
+            } else {
+                ch.start_secs.round() as u64
+            };
+            if use_hours {
+                let h = total_s / 3600;
+                let m = (total_s % 3600) / 60;
+                let s = total_s % 60;
+                format!("{:02}:{:02}:{:02} {}", h, m, s, ch.title)
+            } else {
+                let m = total_s / 60;
+                let s = total_s % 60;
+                format!("{:02}:{:02} {}", m, s, ch.title)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn escape_ffmetadata(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\\' | '=' | ';' | '#' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            '\r' | '\n' => out.push(' '),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+pub(crate) fn write_ffmetadata_chapters(
+    path: &Path,
+    album_title: Option<&str>,
+    chapters: &[ChapterEntry],
+) -> Result<()> {
+    let mut content = String::from(";FFMETADATA1\n");
+    if let Some(alb) = album_title.map(str::trim).filter(|s| !s.is_empty()) {
+        content.push_str(&format!("title={}\n", escape_ffmetadata(alb)));
+    }
+    for ch in chapters {
+        let start_ms = (ch.start_secs * 1000.0).round() as u64;
+        let end_ms = ((ch.end_secs * 1000.0).round() as u64).max(start_ms + 100);
+        content.push_str("[CHAPTER]\nTIMEBASE=1/1000\n");
+        content.push_str(&format!("START={}\n", start_ms));
+        content.push_str(&format!("END={}\n", end_ms));
+        content.push_str(&format!("title={}\n", escape_ffmetadata(&ch.title)));
+    }
+    fs::write(path, content).with_context(|| format!("No se pudo escribir {}", path.display()))
+}
+
+pub(crate) fn write_ffconcat_file(
+    path: &Path,
+    tracks: &[CueTrack],
+    fallback_audio: &Path,
+) -> Result<()> {
+    let mut content = String::from("ffconcat version 1.0\n");
+    for tr in tracks {
+        let src = tr.source_audio.as_deref().unwrap_or(fallback_audio);
+        let abs = fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
+        let mut s = abs.to_string_lossy().to_string();
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            s = stripped.to_string();
+        }
+        let escaped = s.replace('\'', r"'\''");
+        content.push_str(&format!("file '{}'\n", escaped));
+        if tr.start_secs > 0.0 {
+            content.push_str(&format!("inpoint {:.3}\n", tr.start_secs));
+        }
+        if let Some(end) = tr.end_secs {
+            if end > tr.start_secs {
+                content.push_str(&format!("outpoint {:.3}\n", end));
+            }
+        }
+    }
+    fs::write(path, content).with_context(|| format!("No se pudo escribir {}", path.display()))
 }
 
 pub(crate) fn sanitize_filename(name: &str) -> String {
@@ -523,6 +901,7 @@ pub(crate) fn cue_track_output_stem(track: &CueTrack) -> String {
     format!("{:02} - {}", track.track_number, sanitize_filename(&track.title))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn split_cue_to_mp3<FLog, FProg>(
     cue: &CueSheet,
     tracks: &[CueTrack],
@@ -609,9 +988,14 @@ where
                 .to_string();
 
             if let Ok(mut p) = prog_mutex.lock() {
-                p(done_count.load(Ordering::Relaxed), total, &format!("Extrayendo: {}", file_name));
+                p(
+                    done_count.load(Ordering::Relaxed),
+                    total,
+                    &format!("Extrayendo: {}", file_name),
+                );
             }
 
+            let src_audio = tr.source_audio.as_deref().unwrap_or(&cue.audio_path);
             let temp_mp3 = out_mp3.with_file_name(format!(".{}.part.mp3", file_name));
             let mut cmd = new_hidden_command(ffmpeg);
             cmd.arg("-hide_banner")
@@ -627,7 +1011,7 @@ where
             }
 
             cmd.arg("-i")
-                .arg(&cue.audio_path)
+                .arg(src_audio)
                 .arg("-vn")
                 .arg("-c:a")
                 .arg("libmp3lame")
