@@ -23,6 +23,9 @@ use rayon::prelude::*;
 use walkdir::WalkDir;
 
 pub(crate) const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp"];
+pub(crate) const AUDIO_EXTENSIONS: &[&str] = &[
+    "mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "ape", "wv", "wma",
+];
 const COMMON_COVER_NAMES: &[&str] = &[
     "cover.jpg",
     "cover.png",
@@ -342,7 +345,7 @@ pub(crate) fn find_ffmpeg(custom_path: Option<&Path>) -> Result<PathBuf> {
     );
 }
 
-pub(crate) fn collect_mp3_files(
+pub(crate) fn collect_audio_files(
     input: &Path,
     output_dir: &Path,
     recursive: bool,
@@ -352,8 +355,11 @@ pub(crate) fn collect_mp3_files(
     }
 
     if input.is_file() {
-        if !has_extension(input, &["mp3"]) {
-            bail!("El archivo de entrada no es un .mp3: {}", input.display());
+        if !has_extension(input, AUDIO_EXTENSIONS) {
+            bail!(
+                "El archivo de entrada no es un formato de audio soportado (.flac, .mp3, .wav, etc.): {}",
+                input.display()
+            );
         }
         let base_dir = input
             .parent()
@@ -366,7 +372,7 @@ pub(crate) fn collect_mp3_files(
     let output_canon = fs::canonicalize(output_dir).ok();
     let max_depth = if recursive { usize::MAX } else { 1 };
 
-    let mut mp3s = Vec::new();
+    let mut audios = Vec::new();
     let walker = WalkDir::new(input)
         .max_depth(max_depth)
         .follow_links(false)
@@ -386,13 +392,21 @@ pub(crate) fn collect_mp3_files(
 
     for entry in walker.flatten() {
         let path = entry.path();
-        if path.is_file() && has_extension(path, &["mp3"]) {
-            mp3s.push(path.to_path_buf());
+        if path.is_file() && has_extension(path, AUDIO_EXTENSIONS) {
+            audios.push(path.to_path_buf());
         }
     }
 
-    mp3s.sort();
-    Ok((input.to_path_buf(), mp3s))
+    audios.sort();
+    Ok((input.to_path_buf(), audios))
+}
+
+pub(crate) fn collect_mp3_files(
+    input: &Path,
+    output_dir: &Path,
+    recursive: bool,
+) -> Result<(PathBuf, Vec<PathBuf>)> {
+    collect_audio_files(input, output_dir, recursive)
 }
 
 pub(crate) fn output_path_for(
@@ -503,7 +517,12 @@ pub(crate) fn resolve_image(
     None
 }
 
-fn apply_video_and_codec_args(cmd: &mut Command, cfg: &RenderConfig, allow_copy_audio: bool) {
+fn apply_video_and_codec_args(
+    cmd: &mut Command,
+    cfg: &RenderConfig,
+    source_audio: Option<&Path>,
+    allow_copy_audio: bool,
+) {
     let width = cfg.width;
     let height = cfg.height;
     match cfg.fit {
@@ -551,7 +570,11 @@ fn apply_video_and_codec_args(cmd: &mut Command, cfg: &RenderConfig, allow_copy_
         .arg("-crf")
         .arg(cfg.crf.to_string());
 
-    if allow_copy_audio && cfg.copy_audio {
+    let can_copy = allow_copy_audio
+        && cfg.copy_audio
+        && source_audio.is_some_and(|p| has_extension(p, &["mp3", "m4a", "aac"]));
+
+    if can_copy {
         cmd.arg("-c:a").arg("copy");
     } else {
         cmd.arg("-c:a").arg("aac").arg("-b:a").arg(&cfg.audio_bitrate);
@@ -644,7 +667,7 @@ fn run_ffmpeg_video_render(
     }
 
     cmd.arg("-i").arg(audio_path);
-    apply_video_and_codec_args(&mut cmd, cfg, time_range.is_none());
+    apply_video_and_codec_args(&mut cmd, cfg, Some(audio_path), time_range.is_none());
     finalize_ffmpeg_render(cmd, &temp_output, output_path, &audio_path.display().to_string())
 }
 
@@ -731,7 +754,7 @@ pub(crate) fn render_full_album_to_mp4(
     }
 
     cmd.arg("-f").arg("ffmetadata").arg("-i").arg(&ffmeta_path);
-    apply_video_and_codec_args(&mut cmd, cfg, false);
+    apply_video_and_codec_args(&mut cmd, cfg, None, false);
     cmd.arg("-map_metadata").arg("2").arg("-map_chapters").arg("2");
 
     let res = finalize_ffmpeg_render(
@@ -938,6 +961,57 @@ pub(crate) fn build_upload_items(
             }
         })
         .collect()
+}
+
+pub(crate) fn write_video_sidecar_txt(item: &youtube::UploadItem) -> Result<PathBuf> {
+    let txt_path = item.mp4_path.with_extension("txt");
+    let content = format!(
+        "Title:\r\n{}\r\n\r\nDescription:\r\n{}\r\n",
+        item.title.trim(),
+        item.description.trim()
+    );
+    fs::write(&txt_path, content.as_bytes())
+        .with_context(|| format!("No se pudo escribir el archivo TXT: {}", txt_path.display()))?;
+    Ok(txt_path)
+}
+
+pub(crate) fn write_master_tracklist_txt(
+    output_dir: &Path,
+    items: &[youtube::UploadItem],
+) -> Result<PathBuf> {
+    if items.is_empty() {
+        return Ok(output_dir.join("_youtube_tracklist.txt"));
+    }
+    let master_path = output_dir.join("_youtube_tracklist.txt");
+    let mut out = String::new();
+    out.push_str("================================================================================\r\n");
+    out.push_str("YOUTUBE TRACKLIST & DESCRIPTIONS\r\n");
+    out.push_str("================================================================================\r\n\r\n");
+
+    for (idx, item) in items.iter().enumerate() {
+        let file_name = item
+            .mp4_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        out.push_str(&format!("[Video {}] {}\r\n", idx + 1, file_name));
+        out.push_str("Title:\r\n");
+        out.push_str(item.title.trim());
+        out.push_str("\r\n\r\nDescription:\r\n");
+        out.push_str(item.description.trim());
+        out.push_str("\r\n\r\n");
+        if idx + 1 < items.len() {
+            out.push_str("--------------------------------------------------------------------------------\r\n\r\n");
+        }
+    }
+
+    fs::write(&master_path, out.as_bytes()).with_context(|| {
+        format!(
+            "No se pudo escribir el archivo de lista: {}",
+            master_path.display()
+        )
+    })?;
+    Ok(master_path)
 }
 
 fn print_album_summary(album: &vgmdb::AlbumMetadata, title_tpl: &str) {
@@ -1252,18 +1326,25 @@ fn run_cli() -> Result<()> {
         }
     }
 
+    let upload_items = build_upload_items(
+        &all_pairs,
+        album_meta.as_ref(),
+        cfg.ffmpeg_path.as_deref(),
+        &cli.title_template,
+        &cli.desc_template,
+    );
+    for item in &upload_items {
+        let _ = write_video_sidecar_txt(item);
+    }
+    if let Ok(master) = write_master_tracklist_txt(&cfg.output, &upload_items) {
+        println!("Metadata YouTube guardada en: {}", master.display());
+    }
+
     if cli.youtube_upload {
-        let items = build_upload_items(
-            &all_pairs,
-            album_meta.as_ref(),
-            cfg.ffmpeg_path.as_deref(),
-            &cli.title_template,
-            &cli.desc_template,
-        );
         let pl_title_opt = playlist_meta_tuple(cli.youtube_playlist, album_meta.as_ref());
 
         let summary = youtube::upload_videos_batch(
-            &items,
+            &upload_items,
             &cfg.output,
             cli.client_secret.as_deref(),
             yt_privacy,
@@ -1409,14 +1490,18 @@ fn run_cue_cli(
         let timestamps = cue::format_youtube_timestamps(&plan);
         println!("\nTracklist:\n{}", timestamps);
 
+        let item = build_full_album_upload_item(
+            &out_mp4,
+            cue_sheet,
+            album_meta,
+            &timestamps,
+            desc_tpl,
+        );
+        let _ = write_video_sidecar_txt(&item);
+        let _ = write_master_tracklist_txt(&cfg.output, std::slice::from_ref(&item));
+        println!("Metadata YouTube guardada en: {}", cfg.output.join("_youtube_tracklist.txt").display());
+
         if youtube_upload {
-            let item = build_full_album_upload_item(
-                &out_mp4,
-                cue_sheet,
-                album_meta,
-                &timestamps,
-                desc_tpl,
-            );
             let pl_title_opt = playlist_meta_tuple(youtube_playlist, album_meta);
             let summary = youtube::upload_videos_batch(
                 &[item],
@@ -1465,7 +1550,7 @@ fn run_cue_cli(
             pending.par_iter().for_each(|(tr, out_mp4)| {
                 match render_cue_track_to_mp4(
                     ffmpeg,
-                    &cue_sheet.audio_path,
+                    tr.source_audio.as_deref().unwrap_or(&cue_sheet.audio_path),
                     tr,
                     &image_path,
                     out_mp4,
@@ -1498,17 +1583,24 @@ fn run_cue_cli(
         }
     }
 
+    let upload_items = build_upload_items_for_cue(
+        &all_pairs,
+        &cue_sheet,
+        album_meta,
+        title_tpl,
+        desc_tpl,
+    );
+    for item in &upload_items {
+        let _ = write_video_sidecar_txt(item);
+    }
+    if let Ok(master) = write_master_tracklist_txt(&cfg.output, &upload_items) {
+        println!("Metadata YouTube guardada en: {}", master.display());
+    }
+
     if youtube_upload {
-        let items = build_upload_items_for_cue(
-            &all_pairs,
-            &cue_sheet,
-            album_meta,
-            title_tpl,
-            desc_tpl,
-        );
         let pl_title_opt = playlist_meta_tuple(youtube_playlist, album_meta);
         let summary = youtube::upload_videos_batch(
-            &items,
+            &upload_items,
             &cfg.output,
             client_secret,
             yt_privacy,

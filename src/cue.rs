@@ -10,10 +10,12 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::vgmdb::{match_track_for_file, read_mp3_tags, AlbumMetadata};
-use crate::{collect_mp3_files, find_ffprobe, has_extension, new_hidden_command};
+use crate::{
+    collect_audio_files, find_ffprobe, has_extension, new_hidden_command, AUDIO_EXTENSIONS,
+};
 
-pub(crate) const SINGLE_IMAGE_AUDIO_EXTS: &[&str] = &["flac", "wav", "ape", "wv", "m4a", "mp3"];
-pub(crate) const CUE_AUDIO_EXTS: &[&str] = &["flac", "wav", "ape", "wv"];
+pub(crate) const SINGLE_IMAGE_AUDIO_EXTS: &[&str] = AUDIO_EXTENSIONS;
+pub(crate) const CUE_AUDIO_EXTS: &[&str] = AUDIO_EXTENSIONS;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct CueTrack {
@@ -213,11 +215,11 @@ pub(crate) fn resolve_cue_for_input(path: &Path) -> Option<PathBuf> {
     None
 }
 
-pub(crate) fn parse_cue_file(cue_path: &Path) -> Result<CueSheet> {
-    let bytes = fs::read(cue_path)
-        .with_context(|| format!("No se pudo leer el archivo CUE: {}", cue_path.display()))?;
-    let content = decode_cue_bytes(&bytes);
-
+pub(crate) fn parse_cue_content(
+    content: &str,
+    cue_path: &Path,
+    audio_override: Option<&Path>,
+) -> Result<CueSheet> {
     let mut album_title: Option<String> = None;
     let mut album_performer: Option<String> = None;
     let mut catalog: Option<String> = None;
@@ -343,7 +345,11 @@ pub(crate) fn parse_cue_file(cue_path: &Path) -> Result<CueSheet> {
         bail!("El archivo CUE '{}' no contiene pistas (TRACK).", cue_path.display());
     }
 
-    let audio_path = resolve_audio_file(cue_path, file_ref.as_deref())?;
+    let audio_path = if let Some(audio_ovr) = audio_override {
+        audio_ovr.to_path_buf()
+    } else {
+        resolve_audio_file(cue_path, file_ref.as_deref())?
+    };
 
     let mut tracks: Vec<CueTrack> = raw_tracks
         .into_iter()
@@ -385,6 +391,154 @@ pub(crate) fn parse_cue_file(cue_path: &Path) -> Result<CueSheet> {
         catalog,
         date,
         tracks,
+    })
+}
+
+pub(crate) fn parse_cue_file(cue_path: &Path) -> Result<CueSheet> {
+    let bytes = fs::read(cue_path)
+        .with_context(|| format!("No se pudo leer el archivo CUE: {}", cue_path.display()))?;
+    let content = decode_cue_bytes(&bytes);
+    parse_cue_content(&content, cue_path, None)
+}
+
+pub(crate) fn try_extract_embedded_cuesheet(
+    audio_path: &Path,
+    ffmpeg_path: Option<&Path>,
+) -> Option<CueSheet> {
+    let ffprobe = find_ffprobe(ffmpeg_path)?;
+    let out = new_hidden_command(&ffprobe)
+        .arg("-v")
+        .arg("quiet")
+        .arg("-print_format")
+        .arg("json")
+        .arg("-show_format")
+        .arg(audio_path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let tags = json.get("format")?.get("tags")?.as_object()?;
+    for (k, v) in tags {
+        if k.eq_ignore_ascii_case("cuesheet") {
+            if let Some(cue_text) = v.as_str() {
+                if let Ok(sheet) = parse_cue_content(cue_text, audio_path, Some(audio_path)) {
+                    return Some(sheet);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn try_extract_chapters_as_cue(
+    audio_path: &Path,
+    ffmpeg_path: Option<&Path>,
+) -> Option<CueSheet> {
+    let ffprobe = find_ffprobe(ffmpeg_path)?;
+    let out = new_hidden_command(&ffprobe)
+        .arg("-v")
+        .arg("quiet")
+        .arg("-print_format")
+        .arg("json")
+        .arg("-show_chapters")
+        .arg(audio_path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let chapters = json.get("chapters")?.as_array()?;
+    if chapters.is_empty() {
+        return None;
+    }
+    let mut tracks = Vec::new();
+    for (idx, ch) in chapters.iter().enumerate() {
+        let start: f64 = ch.get("start_time")?.as_str()?.parse().ok()?;
+        let end: Option<f64> = ch
+            .get("end_time")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok());
+        let title = ch
+            .get("tags")
+            .and_then(|t| t.get("title"))
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("Track {:02}", idx + 1));
+        tracks.push(CueTrack {
+            track_number: (idx + 1) as u32,
+            title,
+            performer: None,
+            start_secs: start,
+            end_secs: end,
+            source_audio: Some(audio_path.to_path_buf()),
+        });
+    }
+    if tracks.is_empty() {
+        return None;
+    }
+    Some(CueSheet {
+        cue_path: audio_path.to_path_buf(),
+        audio_path: audio_path.to_path_buf(),
+        album_title: None,
+        performer: None,
+        catalog: None,
+        date: None,
+        tracks,
+    })
+}
+
+pub(crate) fn build_cue_from_single_audio_file(
+    path: &Path,
+    album: Option<&AlbumMetadata>,
+    ffmpeg_path: Option<&Path>,
+) -> Result<CueSheet> {
+    if let Some(cue) = try_extract_embedded_cuesheet(path, ffmpeg_path) {
+        return Ok(cue);
+    }
+    if let Some(cue) = try_extract_chapters_as_cue(path, ffmpeg_path) {
+        return Ok(cue);
+    }
+    let id3 = read_mp3_tags(path, ffmpeg_path);
+    let matched = match_track_for_file(path, 0, album, &id3);
+    let title = if album.is_some() || id3.title.is_some() {
+        matched.track_title
+    } else {
+        let stem = path
+            .file_stem()
+            .unwrap_or_else(|| OsStr::new("Track"))
+            .to_string_lossy();
+        clean_mp3_stem_title(&stem)
+    };
+    let dur = probe_audio_duration(path, ffmpeg_path);
+    let track = CueTrack {
+        track_number: 1,
+        title,
+        performer: id3.composer.or(id3.artist),
+        start_secs: 0.0,
+        end_secs: dur,
+        source_audio: Some(path.to_path_buf()),
+    };
+    Ok(CueSheet {
+        cue_path: path.to_path_buf(),
+        audio_path: path.to_path_buf(),
+        album_title: album
+            .map(|a| a.album_title.clone())
+            .filter(|s| !s.is_empty())
+            .or(id3.album),
+        performer: album
+            .map(|a| a.composers.join(", "))
+            .filter(|s| !s.is_empty()),
+        catalog: album
+            .map(|a| a.catalog.clone())
+            .filter(|s| !s.is_empty()),
+        date: album
+            .map(|a| a.release_date.clone())
+            .filter(|s| !s.is_empty())
+            .or(id3.date),
+        tracks: vec![track],
     })
 }
 
@@ -479,21 +633,21 @@ pub(crate) fn build_tracks_from_directory(
         return Ok(merged);
     }
 
-    let (_, mp3_files) = collect_mp3_files(dir, output_dir, recursive)?;
-    if mp3_files.is_empty() {
+    let (_, audio_files) = collect_audio_files(dir, output_dir, recursive)?;
+    if audio_files.is_empty() {
         bail!(
-            "No se encontraron archivos .cue ni .mp3 en '{}'.",
+            "No se encontraron archivos .cue ni archivos de audio (.flac, .mp3, .wav, etc.) en '{}'.",
             dir.display()
         );
     }
 
-    let mut tracks = Vec::with_capacity(mp3_files.len());
+    let mut tracks = Vec::with_capacity(audio_files.len());
     let mut first_album = None;
     let mut first_artist = None;
     let mut first_date = None;
 
-    for (idx, mp3) in mp3_files.iter().enumerate() {
-        let id3 = read_mp3_tags(mp3, ffmpeg_path);
+    for (idx, audio_path) in audio_files.iter().enumerate() {
+        let id3 = read_mp3_tags(audio_path, ffmpeg_path);
         if first_album.is_none() {
             first_album = id3.album.clone();
         }
@@ -504,29 +658,29 @@ pub(crate) fn build_tracks_from_directory(
             first_date = id3.date.clone();
         }
 
-        let matched = match_track_for_file(mp3, idx, album, &id3);
+        let matched = match_track_for_file(audio_path, idx, album, &id3);
         let title = if album.is_some() || id3.title.is_some() {
             matched.track_title
         } else {
-            let stem = mp3
+            let stem = audio_path
                 .file_stem()
                 .unwrap_or_else(|| OsStr::new("Track"))
                 .to_string_lossy();
             clean_mp3_stem_title(&stem)
         };
 
-        let dur = probe_audio_duration(mp3, ffmpeg_path);
+        let dur = probe_audio_duration(audio_path, ffmpeg_path);
         tracks.push(CueTrack {
             track_number: (idx + 1) as u32,
             title,
             performer: id3.composer.or(id3.artist),
             start_secs: 0.0,
             end_secs: dur,
-            source_audio: Some(mp3.clone()),
+            source_audio: Some(audio_path.clone()),
         });
     }
 
-    let fallback_audio = mp3_files[0].clone();
+    let fallback_audio = audio_files[0].clone();
     Ok(CueSheet {
         cue_path: dir.to_path_buf(),
         audio_path: fallback_audio,

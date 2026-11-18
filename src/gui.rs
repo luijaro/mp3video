@@ -60,9 +60,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::cue::{
-    build_tracks_from_directory, compute_timeline, cue_track_output_stem,
-    format_tracks_for_review, format_youtube_timestamps, parse_cue_file, parse_tracks_from_review,
-    resolve_cue_for_input, split_cue_to_mp3, CueSheet, CueTrack,
+    build_cue_from_single_audio_file, build_tracks_from_directory, compute_timeline,
+    cue_track_output_stem, format_tracks_for_review, format_youtube_timestamps, parse_cue_file,
+    parse_tracks_from_review, resolve_cue_for_input, split_cue_to_mp3,
+    try_extract_chapters_as_cue, try_extract_embedded_cuesheet, CueSheet, CueTrack,
 };
 use crate::vgmdb::{lookup_album, AlbumMetadata};
 use crate::youtube::{
@@ -71,10 +72,10 @@ use crate::youtube::{
 };
 use crate::{
     build_full_album_upload_item, build_upload_items, build_upload_items_for_cue,
-    collect_mp3_files, default_jobs, find_ffmpeg, full_album_output_path, has_extension,
+    collect_audio_files, default_jobs, find_ffmpeg, full_album_output_path, has_extension,
     output_path_for, render_cue_track_to_mp4, render_full_album_to_mp4, render_single,
-    resolve_image, FitMode, RenderConfig, RenderJob, DEFAULT_DESC_TEMPLATE,
-    DEFAULT_TITLE_TEMPLATE, IMAGE_EXTENSIONS,
+    resolve_image, write_master_tracklist_txt, write_video_sidecar_txt, FitMode, RenderConfig,
+    RenderJob, AUDIO_EXTENSIONS, DEFAULT_DESC_TEMPLATE, DEFAULT_TITLE_TEMPLATE, IMAGE_EXTENSIONS,
 };
 
 const ACTCTX_FLAG_RESOURCE_NAME_VALID: u32 = 0x0000_0008;
@@ -751,7 +752,7 @@ fn clear_cue_ui(state: &mut GuiState) {
     state.cue_sheet = None;
     set_window_text(
         state.lbl_cue_info,
-        "Sin archivo .cue cargado (elegí o arrastrá un .cue, .flac o carpeta con MP3s)",
+        "Sin pistas cargadas (elegí o arrastrá un .cue, .flac o carpeta con música)",
     );
     set_window_text(state.edit_cue_tracks, "");
 }
@@ -827,40 +828,84 @@ fn apply_loaded_cue_to_ui(
 }
 
 fn try_load_cue_for_path(state: &mut GuiState, path: &Path, populate_album_fields: bool) {
-    let Some(cue_path) = resolve_cue_for_input(path) else {
-        clear_cue_ui(state);
-        return;
-    };
+    if let Some(cue_path) = resolve_cue_for_input(path) {
+        match parse_cue_file(&cue_path) {
+            Ok(cue) => {
+                let audio_name = cue
+                    .audio_path
+                    .file_name()
+                    .unwrap_or_else(|| OsStr::new("?"))
+                    .to_string_lossy()
+                    .to_string();
+                let label = format!(
+                    "CUE: {} ({} pistas) — revisá o editá los títulos abajo:",
+                    audio_name,
+                    cue.tracks.len()
+                );
+                append_log(
+                    state.edit_log,
+                    &format!(
+                        "[CUE] Cargado {} -> Audio: {} ({} pistas)",
+                        cue.cue_path.display(),
+                        audio_name,
+                        cue.tracks.len()
+                    ),
+                );
+                apply_loaded_cue_to_ui(state, &label, cue, populate_album_fields);
+                return;
+            }
+            Err(err) => {
+                clear_cue_ui(state);
+                append_log(state.edit_log, &format!("[CUE AVISO] {:#}", err));
+                return;
+            }
+        }
+    }
 
-    match parse_cue_file(&cue_path) {
-        Ok(cue) => {
-            let audio_name = cue
-                .audio_path
+    let ffmpeg = find_ffmpeg(None).ok();
+    if path.is_file() {
+        if let Some(cue) = try_extract_embedded_cuesheet(path, ffmpeg.as_deref())
+            .or_else(|| try_extract_chapters_as_cue(path, ffmpeg.as_deref()))
+        {
+            let audio_name = path
                 .file_name()
                 .unwrap_or_else(|| OsStr::new("?"))
                 .to_string_lossy()
                 .to_string();
             let label = format!(
-                "CUE: {} ({} pistas) — revisá o editá los títulos abajo:",
+                "CUE embebido en {}: ({} pistas) — revisá o editá los títulos abajo:",
                 audio_name,
                 cue.tracks.len()
             );
             append_log(
                 state.edit_log,
                 &format!(
-                    "[CUE] Cargado {} -> Audio: {} ({} pistas)",
-                    cue.cue_path.display(),
-                    audio_name,
-                    cue.tracks.len()
+                    "[CUE EMBEBIDO] Detectadas {} pistas en '{}'",
+                    cue.tracks.len(),
+                    path.display()
                 ),
             );
             apply_loaded_cue_to_ui(state, &label, cue, populate_album_fields);
+            return;
         }
-        Err(err) => {
-            clear_cue_ui(state);
-            append_log(state.edit_log, &format!("[CUE AVISO] {:#}", err));
+
+        if is_checked(state.chk_full_album) && has_extension(path, AUDIO_EXTENSIONS) {
+            if let Ok(cue) = build_cue_from_single_audio_file(
+                path,
+                state.album_meta.as_ref(),
+                ffmpeg.as_deref(),
+            ) {
+                let label = format!(
+                    "Pista individual: {} — revisá o editá los títulos abajo:",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                );
+                apply_loaded_cue_to_ui(state, &label, cue, populate_album_fields);
+                return;
+            }
         }
     }
+
+    clear_cue_ui(state);
 }
 
 fn try_load_directory_into_review(
@@ -1536,7 +1581,7 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
     state.lbl_cue_info = create_child(
         hwnd,
         "STATIC",
-        "Sin archivo .cue cargado (elegí o arrastrá un .cue, .flac o carpeta con MP3s)",
+        "Sin pistas cargadas (elegí o arrastrá un .cue, .flac o carpeta con música)",
         0,
         0,
         state.px(28),
@@ -1970,7 +2015,7 @@ fn read_upload_settings(state: &GuiState, require_yt_auth: bool) -> Result<Uploa
 fn read_gui_config(state: &GuiState) -> Result<RenderConfig> {
     let input_raw = get_window_text(state.edit_input).trim().to_string();
     if input_raw.is_empty() {
-        bail!("Indicá una carpeta con MP3s, un archivo .mp3 o un archivo .cue/.flac de entrada.");
+        bail!("Indicá una carpeta de audio, un archivo de audio (.flac, .mp3, .wav, etc.) o un archivo .cue.");
     }
     let input = PathBuf::from(&input_raw);
     if !input.exists() {
@@ -2454,12 +2499,14 @@ fn collect_mp4_pairs_for_upload(
     recursive: bool,
 ) -> Vec<(PathBuf, PathBuf)> {
     if input_path.exists() {
-        if let Ok((input_base, mp3s)) = collect_mp3_files(input_path, output_dir, recursive) {
+        if let Ok((input_base, audio_files)) =
+            collect_audio_files(input_path, output_dir, recursive)
+        {
             let mut pairs = Vec::new();
-            for mp3 in mp3s {
-                let mp4 = output_path_for(&mp3, &input_base, output_dir, recursive);
+            for audio in audio_files {
+                let mp4 = output_path_for(&audio, &input_base, output_dir, recursive);
                 if mp4.is_file() {
-                    pairs.push((mp3, mp4));
+                    pairs.push((audio, mp4));
                 }
             }
             if !pairs.is_empty() {
@@ -2782,25 +2829,47 @@ fn run_gui_full_album(
         post_boxed(hwnd, WM_APP_LOG, 0, line.to_string());
     }
 
-    let mut total_errs = 0usize;
-    let mut yt_note = String::new();
-    if upload_cfg.upload_after_render && !cancel_flag.load(Ordering::Relaxed) {
-        let item = build_full_album_upload_item(
-            &out_mp4,
-            cue,
-            upload_cfg.album_meta.as_ref(),
-            &ts_block,
-            &upload_cfg.desc_template,
-        );
+    let full_album_item = build_full_album_upload_item(
+        &out_mp4,
+        cue,
+        upload_cfg.album_meta.as_ref(),
+        &ts_block,
+        &upload_cfg.desc_template,
+    );
+    if let Ok(sidecar) = write_video_sidecar_txt(&full_album_item) {
         post_boxed(
             hwnd,
             WM_APP_LOG,
             0,
-            format!("Subiendo álbum completo '{}' a YouTube...", item.title),
+            format!("[TXT] Guardado: {}", sidecar.display()),
+        );
+    }
+    if let Ok(master) =
+        write_master_tracklist_txt(&cfg.output, std::slice::from_ref(&full_album_item))
+    {
+        post_boxed(
+            hwnd,
+            WM_APP_LOG,
+            0,
+            format!("[TXT] Lista guardada: {}", master.display()),
+        );
+    }
+
+    let mut total_errs = 0usize;
+    let mut yt_note = String::new();
+    if upload_cfg.upload_after_render && !cancel_flag.load(Ordering::Relaxed) {
+        post_boxed(
+            hwnd,
+            WM_APP_LOG,
+            0,
+            format!(
+                "Subiendo álbum completo '{}' a YouTube...",
+                full_album_item.title
+            ),
         );
         match execute_youtube_upload_items(
             hwnd,
-            &[item],
+            &[full_album_item],
             &cfg.output,
             upload_cfg,
             cancel_flag,
@@ -3003,29 +3072,40 @@ fn run_gui_cue_render(
         };
     }
 
-    let mut yt_note = String::new();
-    if upload_cfg.upload_after_render {
-        let items = build_upload_items_for_cue(
-            &all_pairs,
-            cue,
-            upload_cfg.album_meta.as_ref(),
-            &upload_cfg.title_template,
-            &upload_cfg.desc_template,
+    let upload_items = build_upload_items_for_cue(
+        &all_pairs,
+        cue,
+        upload_cfg.album_meta.as_ref(),
+        &upload_cfg.title_template,
+        &upload_cfg.desc_template,
+    );
+    for item in &upload_items {
+        let _ = write_video_sidecar_txt(item);
+    }
+    if let Ok(master) = write_master_tracklist_txt(&cfg.output, &upload_items) {
+        post_boxed(
+            hwnd,
+            WM_APP_LOG,
+            0,
+            format!("[TXT] Guardados archivos .txt y lista: {}", master.display()),
         );
-        if !items.is_empty() {
-            post_boxed(
-                hwnd,
-                WM_APP_LOG,
-                0,
-                format!("Subiendo {} video(s) a YouTube...", items.len()),
-            );
-            match execute_youtube_upload_items(
-                hwnd,
-                &items,
-                &cfg.output,
-                upload_cfg,
-                cancel_flag,
-            ) {
+    }
+
+    let mut yt_note = String::new();
+    if upload_cfg.upload_after_render && !upload_items.is_empty() {
+        post_boxed(
+            hwnd,
+            WM_APP_LOG,
+            0,
+            format!("Subiendo {} video(s) a YouTube...", upload_items.len()),
+        );
+        match execute_youtube_upload_items(
+            hwnd,
+            &upload_items,
+            &cfg.output,
+            upload_cfg,
+            cancel_flag,
+        ) {
                 Ok(yt) => {
                     total_errs += yt.err_count;
                     yt_note = format!(
@@ -3045,7 +3125,6 @@ fn run_gui_cue_render(
                 }
             }
         }
-    }
 
     BatchSummary {
         headline: format!(
@@ -3079,7 +3158,7 @@ fn run_gui_batch(
         }
     };
 
-    let (input_base, mp3_files) = match collect_mp3_files(&cfg.input, &cfg.output, cfg.recursive) {
+    let (input_base, audio_files) = match collect_audio_files(&cfg.input, &cfg.output, cfg.recursive) {
         Ok(res) => res,
         Err(err) => {
             return BatchSummary {
@@ -3090,12 +3169,12 @@ fn run_gui_batch(
         }
     };
 
-    if mp3_files.is_empty() {
+    if audio_files.is_empty() {
         return BatchSummary {
             headline: String::new(),
             err_count: 0,
             error_message: Some(format!(
-                "No se encontraron archivos .mp3 en '{}'.",
+                "No se encontraron archivos de audio (.flac, .mp3, etc.) en '{}'.",
                 cfg.input.display()
             )),
         };
@@ -3114,18 +3193,18 @@ fn run_gui_batch(
         };
     }
 
-    let mut all_pairs = Vec::with_capacity(mp3_files.len());
+    let mut all_pairs = Vec::with_capacity(audio_files.len());
     let mut pending_jobs = Vec::new();
     let mut skipped_count = 0usize;
-    for mp3_path in mp3_files {
-        let output_path = output_path_for(&mp3_path, &input_base, &cfg.output, cfg.recursive);
-        all_pairs.push((mp3_path.clone(), output_path.clone()));
+    for audio_path in audio_files {
+        let output_path = output_path_for(&audio_path, &input_base, &cfg.output, cfg.recursive);
+        all_pairs.push((audio_path.clone(), output_path.clone()));
         if output_path.exists() && !cfg.overwrite {
             skipped_count += 1;
             continue;
         }
         pending_jobs.push(RenderJob {
-            mp3_path,
+            mp3_path: audio_path,
             output_path,
         });
     }
@@ -3255,29 +3334,40 @@ fn run_gui_batch(
         };
     }
 
-    let mut yt_note = String::new();
-    if upload_cfg.upload_after_render {
-        let items = build_upload_items(
-            &all_pairs,
-            upload_cfg.album_meta.as_ref(),
-            Some(&ffmpeg),
-            &upload_cfg.title_template,
-            &upload_cfg.desc_template,
+    let upload_items = build_upload_items(
+        &all_pairs,
+        upload_cfg.album_meta.as_ref(),
+        Some(&ffmpeg),
+        &upload_cfg.title_template,
+        &upload_cfg.desc_template,
+    );
+    for item in &upload_items {
+        let _ = write_video_sidecar_txt(item);
+    }
+    if let Ok(master) = write_master_tracklist_txt(&cfg.output, &upload_items) {
+        post_boxed(
+            hwnd,
+            WM_APP_LOG,
+            0,
+            format!("[TXT] Guardados archivos .txt y lista: {}", master.display()),
         );
-        if !items.is_empty() {
-            post_boxed(
-                hwnd,
-                WM_APP_LOG,
-                0,
-                format!("Subiendo {} video(s) a YouTube...", items.len()),
-            );
-            match execute_youtube_upload_items(
-                hwnd,
-                &items,
-                &cfg.output,
-                upload_cfg,
-                cancel_flag,
-            ) {
+    }
+
+    let mut yt_note = String::new();
+    if upload_cfg.upload_after_render && !upload_items.is_empty() {
+        post_boxed(
+            hwnd,
+            WM_APP_LOG,
+            0,
+            format!("Subiendo {} video(s) a YouTube...", upload_items.len()),
+        );
+        match execute_youtube_upload_items(
+            hwnd,
+            &upload_items,
+            &cfg.output,
+            upload_cfg,
+            cancel_flag,
+        ) {
                 Ok(yt) => {
                     total_errs += yt.err_count;
                     yt_note = format!(
@@ -3297,7 +3387,6 @@ fn run_gui_batch(
                 }
             }
         }
-    }
 
     BatchSummary {
         headline: format!(
@@ -3330,7 +3419,10 @@ fn handle_drop_files(hwnd: HWND, state: &mut GuiState, hdrop: HDROP) {
         let dropped = from_wide_slice(&buf);
         let path = PathBuf::from(&dropped);
 
-        if path.is_dir() || has_extension(&path, &["mp3", "cue", "flac", "wav", "ape", "wv"]) {
+        if path.is_dir()
+            || has_extension(&path, &["cue"])
+            || has_extension(&path, AUDIO_EXTENSIONS)
+        {
             set_window_text(state.edit_input, &dropped);
             if get_window_text(state.edit_output).trim().is_empty() {
                 let base = if path.is_dir() {
@@ -3340,7 +3432,7 @@ fn handle_drop_files(hwnd: HWND, state: &mut GuiState, hdrop: HDROP) {
                 };
                 set_window_text(state.edit_output, &base.join("output").to_string_lossy());
             }
-            if path.is_file() && has_extension(&path, &["cue", "flac", "wav", "ape", "wv"]) {
+            if path.is_file() {
                 try_load_cue_for_path(state, &path, true);
             } else if path.is_dir() && is_checked(state.chk_full_album) {
                 try_load_directory_into_review(state, &path, true, true);
@@ -3403,20 +3495,21 @@ fn handle_command(hwnd: HWND, state: &mut GuiState, cmd_id: usize) {
             let current = get_window_text(state.edit_input);
             if let Some(file) = pick_file(
                 hwnd,
-                "Elegí un archivo MP3, CUE o FLAC",
+                "Elegí un archivo de Audio o CUE",
                 &[
                     (
-                        "Audio / CUE (*.mp3;*.cue;*.flac;*.wav;*.ape)",
-                        "*.mp3;*.cue;*.flac;*.wav;*.ape",
+                        "Audio / CUE (*.flac;*.mp3;*.cue;*.wav;*.m4a;*.ogg;*.opus;*.ape;*.wv)",
+                        "*.flac;*.mp3;*.cue;*.wav;*.m4a;*.ogg;*.opus;*.ape;*.wv",
                     ),
-                    ("Hojas CUE (*.cue)", "*.cue"),
+                    ("Archivos FLAC (*.flac)", "*.flac"),
                     ("Archivos MP3 (*.mp3)", "*.mp3"),
+                    ("Hojas CUE (*.cue)", "*.cue"),
                     ("Todos los archivos (*.*)", "*.*"),
                 ],
                 &current,
             ) {
                 set_window_text(state.edit_input, &file.to_string_lossy());
-                if has_extension(&file, &["cue", "flac", "wav", "ape", "wv"]) {
+                if has_extension(&file, &["cue"]) || has_extension(&file, AUDIO_EXTENSIONS) {
                     try_load_cue_for_path(state, &file, true);
                 } else {
                     clear_cue_ui(state);
@@ -3479,13 +3572,18 @@ fn handle_command(hwnd: HWND, state: &mut GuiState, cmd_id: usize) {
         ID_CHK_FULL_ALBUM => {
             let input_path = PathBuf::from(get_window_text(state.edit_input).trim());
             if is_checked(state.chk_full_album) {
-                if input_path.is_dir() && state.cue_sheet.is_none() {
+                if input_path.is_file()
+                    && (has_extension(&input_path, &["cue"])
+                        || has_extension(&input_path, AUDIO_EXTENSIONS))
+                {
+                    try_load_cue_for_path(state, &input_path, true);
+                } else if input_path.is_dir() && state.cue_sheet.is_none() {
                     try_load_directory_into_review(state, &input_path, true, true);
                 }
             } else if state
                 .cue_sheet
                 .as_ref()
-                .is_some_and(|c| c.cue_path.is_dir())
+                .is_some_and(|c| c.cue_path.is_dir() || c.cue_path == input_path)
             {
                 clear_cue_ui(state);
             }
