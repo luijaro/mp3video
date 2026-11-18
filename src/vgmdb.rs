@@ -11,7 +11,7 @@ use crate::{find_ffprobe, new_hidden_command};
 
 const DEFAULT_VGMDB_BASE_URL: &str = "https://vgmdb.info";
 const MUSICBRAINZ_BASE_URL: &str = "https://musicbrainz.org/ws/2";
-const USER_AGENT: &str = "mp3video-desktop/0.1.0 (local-app)";
+const USER_AGENT: &str = "mp3video/0.1.0 (https://github.com/luijaro/mp3video)";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct TrackInfo {
@@ -51,7 +51,7 @@ pub(crate) fn percent_encode(input: &str) -> String {
     let mut out = String::with_capacity(input.len() * 2);
     for &b in input.as_bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
                 out.push(b as char);
             }
             _ => {
@@ -88,22 +88,33 @@ fn curl_get_json(url: &str, timeout_secs: u32) -> Result<Value> {
     }
 
     let body = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str::<Value>(&body)
-        .with_context(|| format!("La respuesta de {} no es un JSON válido", url))
+    let val: Value = serde_json::from_str(&body)
+        .with_context(|| format!("La respuesta de {} no es un JSON válido", url))?;
+
+    if let Some(err_msg) = val.get("error").and_then(Value::as_str) {
+        bail!("Respuesta de API con error: {}", err_msg);
+    }
+
+    Ok(val)
 }
 
 fn curl_get_json_retry(url: &str, timeout_secs: u32, retries: u32) -> Result<Value> {
     let mut last_err = None;
     for attempt in 0..=retries {
         if attempt > 0 {
-            let wait_ms = 1400 * attempt as u64;
+            let wait_ms = 1800 * (attempt + 1) as u64;
             std::thread::sleep(std::time::Duration::from_millis(wait_ms));
         }
         match curl_get_json(url, timeout_secs) {
             Ok(val) => return Ok(val),
             Err(err) => {
                 let msg = format!("{:#}", err);
-                let retryable = msg.contains("503") || msg.contains("429");
+                let retryable = msg.contains("503")
+                    || msg.contains("429")
+                    || msg.contains("busy")
+                    || msg.contains("rate limit")
+                    || msg.contains("timed out")
+                    || msg.contains("Connection refused");
                 last_err = Some(err);
                 if !retryable {
                     break;
@@ -264,11 +275,174 @@ fn parse_vgmdb_album_json(data: &Value, fallback_catalog: &str) -> Result<AlbumM
     })
 }
 
-fn normalize_catalog(s: &str) -> String {
+pub(crate) fn normalize_catalog(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .flat_map(char::to_uppercase)
         .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CatalogVariants {
+    pub raw: String,
+    pub is_range: bool,
+    pub base_catalog: String,
+    pub individual_discs: Vec<String>,
+    pub normalized_set: Vec<String>,
+}
+
+impl CatalogVariants {
+    pub fn matches(&self, candidate: &str) -> bool {
+        let cand_norm = normalize_catalog(candidate);
+        if cand_norm.is_empty() {
+            return false;
+        }
+
+        // Coincidencia directa contra cualquiera de las variantes normalizadas
+        if self.normalized_set.iter().any(|v| v == &cand_norm) {
+            return true;
+        }
+
+        // Expandir también el candidato por si contiene rango (ej: candidato KECH-1346~7 y búsqueda KECH-1346)
+        let cand_vars = expand_catalog_variants(candidate);
+        if cand_vars
+            .normalized_set
+            .iter()
+            .any(|c| self.normalized_set.iter().any(|v| v == c))
+        {
+            return true;
+        }
+
+        // Si ambos comparten el mismo catálogo base no vacío
+        if !self.base_catalog.is_empty() && !cand_vars.base_catalog.is_empty() {
+            let base_self_norm = normalize_catalog(&self.base_catalog);
+            let base_cand_norm = normalize_catalog(&cand_vars.base_catalog);
+            if base_self_norm == base_cand_norm {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+pub(crate) fn parse_catalog_range(raw: &str) -> Option<(String, u32, u32, usize)> {
+    let normalized = raw.replace('\u{ff5e}', "~"); // normalizar tilde fullwidth ～ a ~
+
+    let (left, right) = if let Some((l, r)) = normalized.split_once('~') {
+        (l.trim(), r.trim())
+    } else if let Some((l, r)) = normalized.split_once('/') {
+        (l.trim(), r.trim())
+    } else if let Some(last_dash_idx) = normalized.rfind('-') {
+        // Solo tratar '-' como separador de rango si existe un guión anterior de prefijo (ej: PCCG-00123-4)
+        if normalized[..last_dash_idx].contains('-') {
+            let l = normalized[..last_dash_idx].trim();
+            let r = normalized[last_dash_idx + 1..].trim();
+            (l, r)
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    if left.is_empty() || right.is_empty() {
+        return None;
+    }
+
+    // Buscar dígitos numéricos al final de `left`
+    let num_start = left
+        .rfind(|c: char| !c.is_ascii_digit())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    if num_start >= left.len() {
+        return None;
+    }
+
+    let prefix = &left[..num_start];
+    let start_digits = &left[num_start..];
+    let start_num: u32 = start_digits.parse().ok()?;
+    let digit_len = start_digits.len();
+
+    if !right.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    let end_num: u32 = if right.len() < digit_len {
+        let keep_len = digit_len - right.len();
+        let prefix_digits = &start_digits[..keep_len];
+        let end_str = format!("{}{}", prefix_digits, right);
+        end_str.parse().ok()?
+    } else if right.len() == digit_len {
+        right.parse().ok()?
+    } else {
+        return None;
+    };
+
+    if end_num >= start_num && (end_num - start_num) <= 30 {
+        Some((prefix.to_string(), start_num, end_num, digit_len))
+    } else {
+        None
+    }
+}
+
+pub(crate) fn expand_catalog_variants(raw: &str) -> CatalogVariants {
+    let trimmed = raw.trim();
+    if let Some((prefix, start_num, end_num, digit_len)) = parse_catalog_range(trimmed) {
+        let base_catalog = format!("{}{:0width$}", prefix, start_num, width = digit_len);
+        let mut individual_discs = Vec::new();
+        for n in start_num..=end_num {
+            individual_discs.push(format!("{}{:0width$}", prefix, n, width = digit_len));
+        }
+
+        let mut normalized_set = Vec::new();
+        let norm_raw = normalize_catalog(trimmed);
+        if !norm_raw.is_empty() {
+            normalized_set.push(norm_raw);
+        }
+        let norm_base = normalize_catalog(&base_catalog);
+        if !normalized_set.contains(&norm_base) {
+            normalized_set.push(norm_base);
+        }
+        for disc in &individual_discs {
+            let nd = normalize_catalog(disc);
+            if !normalized_set.contains(&nd) {
+                normalized_set.push(nd);
+            }
+        }
+        let full_range = format!(
+            "{}{:0width$}{:0width$}",
+            prefix,
+            start_num,
+            end_num,
+            width = digit_len
+        );
+        let nd_full = normalize_catalog(&full_range);
+        if !normalized_set.contains(&nd_full) {
+            normalized_set.push(nd_full);
+        }
+
+        CatalogVariants {
+            raw: trimmed.to_string(),
+            is_range: true,
+            base_catalog,
+            individual_discs,
+            normalized_set,
+        }
+    } else {
+        let norm = normalize_catalog(trimmed);
+        CatalogVariants {
+            raw: trimmed.to_string(),
+            is_range: false,
+            base_catalog: trimmed.to_string(),
+            individual_discs: vec![trimmed.to_string()],
+            normalized_set: if norm.is_empty() {
+                Vec::new()
+            } else {
+                vec![norm]
+            },
+        }
+    }
 }
 
 fn lookup_via_vgmdb_api(query: &str, base_url: &str) -> Result<AlbumMetadata> {
@@ -280,12 +454,12 @@ fn lookup_via_vgmdb_api(query: &str, base_url: &str) -> Result<AlbumMetadata> {
         .or_else(|| trimmed.chars().all(|c| c.is_ascii_digit()).then_some(trimmed))
     {
         let url = format!("{}/album/{}?format=json", base, id);
-        let data = curl_get_json(&url, 3)?;
+        let data = curl_get_json(&url, 8)?;
         return parse_vgmdb_album_json(&data, trimmed);
     }
 
     let search_url = format!("{}/search/albums/{}?format=json", base, percent_encode(trimmed));
-    let search_json = curl_get_json(&search_url, 3)?;
+    let search_json = curl_get_json(&search_url, 8)?;
     let albums = search_json
         .get("results")
         .and_then(|r| r.get("albums"))
@@ -293,15 +467,25 @@ fn lookup_via_vgmdb_api(query: &str, base_url: &str) -> Result<AlbumMetadata> {
         .filter(|arr| !arr.is_empty())
         .with_context(|| format!("VGMdb no devolvió resultados para '{}'", trimmed))?;
 
-    let target_norm = normalize_catalog(trimmed);
+    let target_variants = expand_catalog_variants(trimmed);
     let chosen = albums
         .iter()
         .find(|item| {
             item.get("catalog")
                 .and_then(Value::as_str)
-                .is_some_and(|c| normalize_catalog(c) == target_norm)
-        })
-        .unwrap_or(&albums[0]);
+                .is_some_and(|c| target_variants.matches(c))
+        });
+
+    let chosen = match chosen {
+        Some(alb) => alb,
+        None => {
+            bail!(
+                "VGMdb devolvió {} resultado(s) pero ninguno coincide con el catálogo '{}'.",
+                albums.len(),
+                trimmed
+            );
+        }
+    };
 
     let link = chosen
         .get("link")
@@ -310,7 +494,7 @@ fn lookup_via_vgmdb_api(query: &str, base_url: &str) -> Result<AlbumMetadata> {
         .context("Resultado de búsqueda en VGMdb sin campo 'link'")?;
 
     let album_url = format!("{}/{}?format=json", base, link);
-    let album_json = curl_get_json(&album_url, 3)?;
+    let album_json = curl_get_json(&album_url, 8)?;
     parse_vgmdb_album_json(&album_json, trimmed)
 }
 
@@ -414,12 +598,25 @@ fn format_ms_duration(ms: u64) -> String {
     format!("{}:{:02}", mins, secs)
 }
 
+fn build_musicbrainz_catalog_query(variants: &CatalogVariants) -> String {
+    if variants.is_range {
+        format!(
+            "catno:\"{}\" OR catno:\"{}\"",
+            variants.raw, variants.base_catalog
+        )
+    } else {
+        format!("catno:\"{}\"", variants.raw)
+    }
+}
+
 fn lookup_via_musicbrainz(catalog_query: &str) -> Result<AlbumMetadata> {
     let trimmed = catalog_query.trim();
+    let variants = expand_catalog_variants(trimmed);
+    let mb_query = build_musicbrainz_catalog_query(&variants);
     let search_url = format!(
-        "{}/release/?query=catno:{}&fmt=json",
+        "{}/release/?query={}&fmt=json",
         MUSICBRAINZ_BASE_URL,
-        percent_encode(trimmed)
+        percent_encode(&mb_query)
     );
     let search_json = curl_get_json_retry(&search_url, 12, 4)?;
     let releases = search_json
@@ -428,21 +625,28 @@ fn lookup_via_musicbrainz(catalog_query: &str) -> Result<AlbumMetadata> {
         .filter(|arr| !arr.is_empty())
         .with_context(|| format!("No se encontró el catálogo '{}' en MusicBrainz", trimmed))?;
 
-    let target_norm = normalize_catalog(trimmed);
-    let chosen = releases
-        .iter()
-        .find(|rel| {
-            rel.get("label-info")
-                .and_then(Value::as_array)
-                .is_some_and(|labels| {
-                    labels.iter().any(|li| {
-                        li.get("catalog-number")
-                            .and_then(Value::as_str)
-                            .is_some_and(|c| normalize_catalog(c) == target_norm)
-                    })
+    let chosen = releases.iter().find(|rel| {
+        rel.get("label-info")
+            .and_then(Value::as_array)
+            .is_some_and(|labels| {
+                labels.iter().any(|li| {
+                    li.get("catalog-number")
+                        .and_then(Value::as_str)
+                        .is_some_and(|c| variants.matches(c))
                 })
-        })
-        .unwrap_or(&releases[0]);
+            })
+    });
+
+    let chosen = match chosen {
+        Some(rel) => rel,
+        None => {
+            bail!(
+                "MusicBrainz devolvió {} resultado(s) pero ninguno coincide con el catálogo '{}'.",
+                releases.len(),
+                trimmed
+            );
+        }
+    };
 
     let release_id = chosen
         .get("id")
@@ -488,7 +692,11 @@ fn lookup_via_musicbrainz(catalog_query: &str) -> Result<AlbumMetadata> {
                 .filter_map(|li| li.get("catalog-number").and_then(Value::as_str))
                 .collect();
             if !cats.is_empty() {
-                catalog = cats.join(" / ");
+                if variants.is_range {
+                    catalog = trimmed.to_string();
+                } else {
+                    catalog = cats.join(" / ");
+                }
             }
         }
     }
@@ -1031,4 +1239,116 @@ pub(crate) fn build_tags(meta: &ResolvedTrackMetadata) -> Vec<String> {
     push_tag("VGM");
     tags.truncate(15);
     tags
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_percent_encode() {
+        assert_eq!(percent_encode("SQEX-10001"), "SQEX-10001");
+        assert_eq!(percent_encode("KECH-1346~7"), "KECH-1346%7E7");
+        assert_eq!(percent_encode("catno:\"KECH-1346~7\""), "catno%3A%22KECH-1346%7E7%22");
+    }
+
+    #[test]
+    fn test_expand_catalog_variants_tilde_single_digit() {
+        let v = expand_catalog_variants("KECH-1346~7");
+        assert!(v.is_range);
+        assert_eq!(v.base_catalog, "KECH-1346");
+        assert_eq!(v.individual_discs, vec!["KECH-1346", "KECH-1347"]);
+        assert!(v.matches("KECH-1346"));
+        assert!(v.matches("KECH-1347"));
+        assert!(v.matches("KECH-1346~7"));
+        assert!(v.matches("KECH-1346/7"));
+        // No debe coincidir con un catálogo diferente como KECH-1436
+        assert!(!v.matches("KECH-1436"));
+        assert!(!v.matches("SQEX-10001"));
+    }
+
+    #[test]
+    fn test_expand_catalog_variants_fullwidth_tilde() {
+        let v = expand_catalog_variants("KECH-1346～7");
+        assert!(v.is_range);
+        assert_eq!(v.base_catalog, "KECH-1346");
+        assert_eq!(v.individual_discs, vec!["KECH-1346", "KECH-1347"]);
+        assert!(v.matches("KECH-1346"));
+        assert!(v.matches("KECH-1347"));
+    }
+
+    #[test]
+    fn test_expand_catalog_variants_multi_disc_box() {
+        let v = expand_catalog_variants("SQEX-10001~4");
+        assert!(v.is_range);
+        assert_eq!(v.base_catalog, "SQEX-10001");
+        assert_eq!(
+            v.individual_discs,
+            vec!["SQEX-10001", "SQEX-10002", "SQEX-10003", "SQEX-10004"]
+        );
+        assert!(v.matches("SQEX-10001"));
+        assert!(v.matches("SQEX-10002"));
+        assert!(v.matches("SQEX-10003"));
+        assert!(v.matches("SQEX-10004"));
+        assert!(v.matches("SQEX-10001~4"));
+        assert!(!v.matches("SQEX-10005"));
+    }
+
+    #[test]
+    fn test_expand_catalog_variants_two_digit_suffix() {
+        let v = expand_catalog_variants("CPCA-10128~30");
+        assert!(v.is_range);
+        assert_eq!(v.base_catalog, "CPCA-10128");
+        assert_eq!(
+            v.individual_discs,
+            vec!["CPCA-10128", "CPCA-10129", "CPCA-10130"]
+        );
+        assert!(v.matches("CPCA-10128"));
+        assert!(v.matches("CPCA-10130"));
+        assert!(!v.matches("CPCA-10131"));
+    }
+
+    #[test]
+    fn test_expand_catalog_variants_full_numbers() {
+        let v = expand_catalog_variants("SVWC-7001~7002");
+        assert!(v.is_range);
+        assert_eq!(v.base_catalog, "SVWC-7001");
+        assert_eq!(v.individual_discs, vec!["SVWC-7001", "SVWC-7002"]);
+        assert!(v.matches("SVWC-7001"));
+        assert!(v.matches("SVWC-7002"));
+    }
+
+    #[test]
+    fn test_expand_catalog_variants_slash() {
+        let v = expand_catalog_variants("ABC-123/4");
+        assert!(v.is_range);
+        assert_eq!(v.base_catalog, "ABC-123");
+        assert_eq!(v.individual_discs, vec!["ABC-123", "ABC-124"]);
+        assert!(v.matches("ABC-123"));
+        assert!(v.matches("ABC-124"));
+    }
+
+    #[test]
+    fn test_single_catalog_matching() {
+        let v = expand_catalog_variants("SQEX-10001");
+        assert!(!v.is_range);
+        assert_eq!(v.base_catalog, "SQEX-10001");
+        assert!(v.matches("SQEX-10001"));
+        assert!(v.matches("sqex 10001"));
+        // Coincide también si el disco de la base de datos tiene la notación multi-disco completa
+        assert!(v.matches("SQEX-10001~4"));
+        assert!(!v.matches("SQEX-10002"));
+    }
+
+    #[test]
+    fn test_build_mb_query() {
+        let v_single = expand_catalog_variants("SQEX-10001");
+        assert_eq!(build_musicbrainz_catalog_query(&v_single), "catno:\"SQEX-10001\"");
+
+        let v_range = expand_catalog_variants("KECH-1346~7");
+        assert_eq!(
+            build_musicbrainz_catalog_query(&v_range),
+            "catno:\"KECH-1346~7\" OR catno:\"KECH-1346\""
+        );
+    }
 }

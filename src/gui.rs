@@ -103,6 +103,7 @@ const ID_BTN_UPLOAD_ONLY: usize = 112;
 const ID_BTN_SPLIT_CUE_MP3: usize = 113;
 const ID_BTN_COPY_TIMESTAMPS: usize = 114;
 const ID_CHK_FULL_ALBUM: usize = 115;
+const ID_BTN_VGMDB_JSON: usize = 116;
 
 const RESOLUTIONS: &[(&str, (u32, u32))] = &[
     ("1920x1080 (Full HD 16:9)", (1920, 1080)),
@@ -253,6 +254,7 @@ struct GuiState {
     chk_overwrite: HWND,
     edit_vgmdb_code: HWND,
     btn_vgmdb_search: HWND,
+    btn_vgmdb_json: HWND,
     lbl_vgmdb_info: HWND,
     edit_album: HWND,
     edit_composers: HWND,
@@ -310,6 +312,7 @@ impl GuiState {
             chk_overwrite: null_mut(),
             edit_vgmdb_code: null_mut(),
             btn_vgmdb_search: null_mut(),
+            btn_vgmdb_json: null_mut(),
             lbl_vgmdb_info: null_mut(),
             edit_album: null_mut(),
             edit_composers: null_mut(),
@@ -347,7 +350,7 @@ impl GuiState {
         (logical_px * self.dpi + 48) / 96
     }
 
-    fn editable_controls(&self) -> [HWND; 33] {
+    fn editable_controls(&self) -> [HWND; 34] {
         [
             self.edit_input,
             self.btn_browse_input_dir,
@@ -367,6 +370,7 @@ impl GuiState {
             self.chk_overwrite,
             self.edit_vgmdb_code,
             self.btn_vgmdb_search,
+            self.btn_vgmdb_json,
             self.edit_album,
             self.edit_composers,
             self.edit_title_tpl,
@@ -1385,7 +1389,7 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         WS_EX_CLIENTEDGE,
         state.px(120),
         state.px(258),
-        state.px(184),
+        state.px(175),
         state.px(23),
         0,
         f_reg,
@@ -1393,25 +1397,38 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
     state.btn_vgmdb_search = create_child(
         hwnd,
         "BUTTON",
-        "🔍 Buscar Disco",
+        "🔍 Buscar",
         BS_PUSHBUTTON as u32 | WS_TABSTOP,
         0,
-        state.px(310),
+        state.px(301),
         state.px(258),
-        state.px(140),
+        state.px(110),
         state.px(23),
         ID_BTN_VGMDB_SEARCH,
+        f_reg,
+    );
+    state.btn_vgmdb_json = create_child(
+        hwnd,
+        "BUTTON",
+        "📂 Cargar JSON",
+        BS_PUSHBUTTON as u32 | WS_TABSTOP,
+        0,
+        state.px(417),
+        state.px(258),
+        state.px(120),
+        state.px(23),
+        ID_BTN_VGMDB_JSON,
         f_reg,
     );
     state.lbl_vgmdb_info = create_child(
         hwnd,
         "STATIC",
-        "Sin disco cargado (ej: SQEX-10001)",
+        "Sin disco cargado (ej: SQEX-10001, KECH-1346~7)",
         0,
         0,
-        state.px(460),
+        state.px(545),
         state.px(261),
-        state.px(412),
+        state.px(327),
         state.px(16),
         0,
         f_small,
@@ -2143,6 +2160,7 @@ fn start_vgmdb_search(hwnd: HWND, state: &mut GuiState) {
     state.is_searching = true;
     unsafe {
         EnableWindow(state.btn_vgmdb_search, 0);
+        EnableWindow(state.btn_vgmdb_json, 0);
     }
     set_window_text(state.lbl_vgmdb_info, "Consultando VGMdb / MusicBrainz...");
     append_log(state.edit_log, &format!("Buscando álbum '{}'...", code));
@@ -3554,6 +3572,20 @@ fn handle_command(hwnd: HWND, state: &mut GuiState, cmd_id: usize) {
             }
         }
         ID_BTN_VGMDB_SEARCH => start_vgmdb_search(hwnd, state),
+        ID_BTN_VGMDB_JSON => {
+            let current = get_window_text(state.edit_vgmdb_code);
+            if let Some(file) = pick_file(
+                hwnd,
+                "Elegí un archivo JSON de VGMdb",
+                &[("Archivo JSON (*.json)", "*.json"), ("Todos (*.*)", "*.*")],
+                &current,
+            ) {
+                let path_str = file.to_string_lossy().to_string();
+                set_window_text(state.edit_vgmdb_code, &path_str);
+                save_settings(state);
+                start_vgmdb_search(hwnd, state);
+            }
+        }
         ID_BTN_BROWSE_SECRET => {
             let current = get_window_text(state.edit_client_secret);
             if let Some(file) = pick_file(
@@ -3785,7 +3817,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_APP_VGMDB_DONE => {
             state.is_searching = false;
             if !state.is_running {
-                EnableWindow(state.btn_vgmdb_search, 1);
+                unsafe {
+                    EnableWindow(state.btn_vgmdb_search, 1);
+                    EnableWindow(state.btn_vgmdb_json, 1);
+                }
             }
             if lparam != 0 {
                 let res = Box::from_raw(lparam as *mut std::result::Result<AlbumMetadata, String>);
@@ -3837,7 +3872,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     Err(err_msg) => {
                         set_window_text(state.lbl_vgmdb_info, "No se encontró el disco.");
                         append_log(state.edit_log, &format!("[BUSQUEDA ERROR] {}", err_msg));
-                        show_msg_box(hwnd, "Búsqueda de disco", &err_msg, MB_OK | MB_ICONWARNING);
+                        let friendly = format!(
+                            "{}\n\nNota: Podés cargar los datos directamente desde un archivo con el botón '📂 Cargar JSON' o completar los campos manualmente.",
+                            err_msg
+                        );
+                        show_msg_box(hwnd, "Búsqueda de disco", &friendly, MB_OK | MB_ICONWARNING);
                     }
                 }
             }
