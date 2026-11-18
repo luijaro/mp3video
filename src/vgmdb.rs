@@ -445,14 +445,213 @@ pub(crate) fn expand_catalog_variants(raw: &str) -> CatalogVariants {
     }
 }
 
+pub(crate) fn extract_vgmdb_album_id(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Si ya son solo dígitos (ej: "10200")
+    if trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return Some(trimmed.to_string());
+    }
+
+    // Si es una URL o ruta con "album/<id>" (ej: "https://vgmdb.net/album/10200", "vgmdb.net/album/10200" o "album/10200")
+    if let Some(pos) = trimmed.find("album/") {
+        let after = &trimmed[pos + "album/".len()..];
+        let id: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !id.is_empty() {
+            return Some(id);
+        }
+    }
+
+    None
+}
+
+fn strip_html_tags(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for c in input.chars() {
+        if c == '<' {
+            in_tag = true;
+        } else if c == '>' {
+            in_tag = false;
+        } else if !in_tag {
+            out.push(c);
+        }
+    }
+    decode_html_entities(&out)
+}
+
+fn decode_html_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#039;", "'")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+}
+
+fn extract_between<'a>(input: &'a str, start: &str, end: &str) -> Option<&'a str> {
+    let start_idx = input.find(start)? + start.len();
+    let rest = &input[start_idx..];
+    let end_idx = rest.find(end)?;
+    Some(&rest[..end_idx])
+}
+
+fn extract_table_cell_after(html: &str, label: &str) -> Option<String> {
+    let pos = html.find(label)?;
+    let rest = &html[pos + label.len()..];
+    let td_start = rest.find("<td")?;
+    let content_start = rest[td_start..].find('>')? + td_start + 1;
+    let td_end = rest[content_start..].find("</td>")? + content_start;
+    let raw = &rest[content_start..td_end];
+    let clean = strip_html_tags(raw).trim().to_string();
+    if clean.is_empty() {
+        None
+    } else {
+        Some(clean)
+    }
+}
+
+pub(crate) fn parse_vgmdb_html(html: &str, fallback_catalog: &str) -> Result<AlbumMetadata> {
+    // 1. Título del álbum
+    let mut album_title = None;
+    if let Some(span) = extract_between(html, "class=\"albumtitle\"", "</span>") {
+        let after_tag = span.find('>').map(|i| &span[i + 1..]).unwrap_or(span);
+        let clean = strip_html_tags(after_tag).trim().to_string();
+        if !clean.is_empty() {
+            album_title = Some(clean);
+        }
+    }
+    if album_title.is_none() {
+        if let Some(title_tag) = extract_between(html, "<title>", "</title>") {
+            let clean = strip_html_tags(title_tag);
+            let without_vgmdb = clean.trim_end_matches("- VGMdb").trim();
+            if let Some((_, right)) = without_vgmdb.split_once('|') {
+                let t = right.trim().to_string();
+                if !t.is_empty() {
+                    album_title = Some(t);
+                }
+            } else if !without_vgmdb.is_empty() {
+                album_title = Some(without_vgmdb.to_string());
+            }
+        }
+    }
+    let album_title = album_title
+        .context("No se pudo encontrar el título del álbum en el HTML de VGMdb")?;
+
+    // 2. Código de catálogo
+    let mut catalog = extract_table_cell_after(html, "Catalog Number")
+        .unwrap_or_else(|| fallback_catalog.to_string());
+    if catalog.is_empty() {
+        if let Some(title_tag) = extract_between(html, "<title>", "</title>") {
+            let clean = strip_html_tags(title_tag);
+            if let Some((left, _)) = clean.split_once('|') {
+                let cat = left.trim();
+                if !cat.is_empty() {
+                    catalog = cat.to_string();
+                }
+            }
+        }
+    }
+
+    // 3. Fecha de lanzamiento
+    let release_date = extract_table_cell_after(html, "Release Date").unwrap_or_default();
+
+    // 4. Publicador / Organización
+    let publisher = extract_table_cell_after(html, "Publish Organization")
+        .or_else(|| extract_table_cell_after(html, "Publisher"))
+        .or_else(|| extract_table_cell_after(html, "Organizations"))
+        .unwrap_or_default();
+
+    // 5. Compositores
+    let mut composers = Vec::new();
+    if let Some(comp_str) = extract_table_cell_after(html, "Composed by")
+        .or_else(|| extract_table_cell_after(html, "Composer"))
+    {
+        for part in comp_str.split([',', '/']) {
+            let clean = part.trim().to_string();
+            if !clean.is_empty() && !composers.contains(&clean) {
+                composers.push(clean);
+            }
+        }
+    }
+
+    // 6. Pistas
+    let mut tracks = Vec::new();
+    let mut current_disc = 1u32;
+    let mut current_track = 1u32;
+
+    for line in html.lines() {
+        let trimmed_line = line.trim();
+        if (trimmed_line.contains("Disc ") || trimmed_line.contains("CD "))
+            && (trimmed_line.contains("<span")
+                || trimmed_line.contains("<td")
+                || trimmed_line.contains("<b"))
+        {
+            if let Some(pos) = trimmed_line.find("Disc ").or_else(|| trimmed_line.find("CD ")) {
+                let after = &trimmed_line[pos + 4..].trim_start();
+                let num_digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(d) = num_digits.parse::<u32>() {
+                    if d > 0 {
+                        current_disc = d;
+                        current_track = 1;
+                    }
+                }
+            }
+        }
+
+        if trimmed_line.contains("class=\"trackname\"") || trimmed_line.contains("class='trackname'") {
+            let title = extract_between(trimmed_line, "class=\"trackname\"", "</span>")
+                .or_else(|| extract_between(trimmed_line, "class='trackname'", "</span>"))
+                .map(|s| {
+                    let inside = s.find('>').map(|i| &s[i + 1..]).unwrap_or(s);
+                    strip_html_tags(inside).trim().to_string()
+                })
+                .unwrap_or_default();
+
+            if !title.is_empty() {
+                let duration = extract_between(trimmed_line, "class=\"time\"", "</span>")
+                    .or_else(|| extract_between(trimmed_line, "class='time'", "</span>"))
+                    .map(|s| {
+                        let inside = s.find('>').map(|i| &s[i + 1..]).unwrap_or(s);
+                        strip_html_tags(inside).trim().to_string()
+                    })
+                    .unwrap_or_default();
+
+                tracks.push(TrackInfo {
+                    disc_number: current_disc,
+                    track_number: current_track,
+                    title,
+                    duration,
+                    composers: composers.clone(),
+                });
+                current_track += 1;
+            }
+        }
+    }
+
+    Ok(AlbumMetadata {
+        source: "VGMdb (HTML)".to_string(),
+        album_title,
+        catalog,
+        release_date,
+        publisher,
+        composers,
+        arrangers: Vec::new(),
+        performers: Vec::new(),
+        lyricists: Vec::new(),
+        tracks,
+    })
+}
+
 fn lookup_via_vgmdb_api(query: &str, base_url: &str) -> Result<AlbumMetadata> {
     let base = base_url.trim_end_matches('/');
     let trimmed = query.trim();
 
-    if let Some(id) = trimmed
-        .strip_prefix("album/")
-        .or_else(|| trimmed.chars().all(|c| c.is_ascii_digit()).then_some(trimmed))
-    {
+    if let Some(id) = extract_vgmdb_album_id(trimmed) {
         let url = format!("{}/album/{}?format=json", base, id);
         let data = curl_get_json(&url, 8)?;
         return parse_vgmdb_album_json(&data, trimmed);
@@ -913,16 +1112,24 @@ fn lookup_via_musicbrainz(catalog_query: &str) -> Result<AlbumMetadata> {
 pub(crate) fn lookup_album(query: &str, vgmdb_base_url: Option<&str>) -> Result<AlbumMetadata> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
-        bail!("Ingresá un código de catálogo (ej: SQEX-10001) o ID de VGMdb.");
+        bail!("Ingresá un código de catálogo (ej: SQEX-10001) o URL/ID de VGMdb.");
     }
 
     let as_path = Path::new(trimmed);
-    if as_path.is_file() && as_path.extension().and_then(OsStr::to_str).is_some_and(|e| e.eq_ignore_ascii_case("json")) {
-        let raw = fs::read_to_string(as_path)
-            .with_context(|| format!("No se pudo leer el JSON {}", as_path.display()))?;
-        let val: Value = serde_json::from_str(raw.trim_start_matches('\u{feff}'))
-            .with_context(|| format!("El archivo {} no es un JSON válido", as_path.display()))?;
-        return parse_vgmdb_album_json(&val, "");
+    if as_path.is_file() {
+        if let Some(ext) = as_path.extension().and_then(OsStr::to_str) {
+            if ext.eq_ignore_ascii_case("json") {
+                let raw = fs::read_to_string(as_path)
+                    .with_context(|| format!("No se pudo leer el JSON {}", as_path.display()))?;
+                let val: Value = serde_json::from_str(raw.trim_start_matches('\u{feff}'))
+                    .with_context(|| format!("El archivo {} no es un JSON válido", as_path.display()))?;
+                return parse_vgmdb_album_json(&val, "");
+            } else if ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm") {
+                let raw = fs::read_to_string(as_path)
+                    .with_context(|| format!("No se pudo leer el archivo HTML {}", as_path.display()))?;
+                return parse_vgmdb_html(&raw, "");
+            }
+        }
     }
 
     let base_url = vgmdb_base_url
@@ -933,10 +1140,12 @@ pub(crate) fn lookup_album(query: &str, vgmdb_base_url: Option<&str>) -> Result<
     match lookup_via_vgmdb_api(trimmed, base_url) {
         Ok(album) => Ok(album),
         Err(vgmdb_err) => {
-            if trimmed.chars().all(|c| c.is_ascii_digit()) {
+            if let Some(id) = extract_vgmdb_album_id(trimmed) {
                 bail!(
-                    "No se pudo consultar VGMdb para el ID {} ({:#}). Probá con el código de catálogo (ej: SQEX-10001).",
+                    "No se pudo consultar VGMdb para la URL/ID '{}' (ID: {}) ({:#}). \
+                     Si la API de vgmdb.info está temporalmente fuera de servicio, podés guardar la página en tu navegador (Ctrl+S) y cargarla con el botón '📂 Cargar JSON / HTML'.",
                     trimmed,
+                    id,
                     vgmdb_err
                 );
             }
@@ -1350,5 +1559,81 @@ mod tests {
             build_musicbrainz_catalog_query(&v_range),
             "catno:\"KECH-1346~7\" OR catno:\"KECH-1346\""
         );
+    }
+
+    #[test]
+    fn test_extract_vgmdb_album_id() {
+        assert_eq!(
+            extract_vgmdb_album_id("https://vgmdb.net/album/10200"),
+            Some("10200".to_string())
+        );
+        assert_eq!(
+            extract_vgmdb_album_id("http://vgmdb.net/album/10200/"),
+            Some("10200".to_string())
+        );
+        assert_eq!(
+            extract_vgmdb_album_id("https://www.vgmdb.net/album/10200?format=json"),
+            Some("10200".to_string())
+        );
+        assert_eq!(
+            extract_vgmdb_album_id("vgmdb.net/album/10200"),
+            Some("10200".to_string())
+        );
+        assert_eq!(
+            extract_vgmdb_album_id("album/10200"),
+            Some("10200".to_string())
+        );
+        assert_eq!(
+            extract_vgmdb_album_id("10200"),
+            Some("10200".to_string())
+        );
+        assert_eq!(extract_vgmdb_album_id("KECH-1346~7"), None);
+        assert_eq!(extract_vgmdb_album_id("SQEX-10001"), None);
+    }
+
+    #[test]
+    fn test_parse_vgmdb_html() {
+        let sample_html = r#"
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>KECH-1346~7 | Zill O'll ~infinite~ Original Sound Track &amp; Drama - VGMdb</title>
+        </head>
+        <body>
+            <span class="albumtitle" lang="en">Zill O'll ~infinite~ Original Sound Track &amp; Drama</span>
+            <table>
+                <tr><td>Catalog Number</td><td>KECH-1346~7</td></tr>
+                <tr><td>Release Date</td><td>Oct 26, 2005</td></tr>
+                <tr><td>Publish Organization</td><td>KOEI</td></tr>
+                <tr><td>Composed by</td><td>Kunihiro Kawano</td></tr>
+            </table>
+            <div id="tracklist">
+                <span>Disc 1</span>
+                <tr><span class="trackname">Prologue</span> <span class="time">1:45</span></tr>
+                <tr><span class="trackname">Theme of Zill O'll</span> <span class="time">3:20</span></tr>
+                <span>Disc 2</span>
+                <tr><span class="trackname">Drama Chapter 1</span> <span class="time">12:30</span></tr>
+            </div>
+        </body>
+        </html>
+        "#;
+
+        let meta = parse_vgmdb_html(sample_html, "").expect("Debe parsear HTML de VGMdb");
+        assert_eq!(meta.album_title, "Zill O'll ~infinite~ Original Sound Track & Drama");
+        assert_eq!(meta.catalog, "KECH-1346~7");
+        assert_eq!(meta.release_date, "Oct 26, 2005");
+        assert_eq!(meta.publisher, "KOEI");
+        assert_eq!(meta.composers, vec!["Kunihiro Kawano"]);
+        assert_eq!(meta.tracks.len(), 3);
+        assert_eq!(meta.tracks[0].disc_number, 1);
+        assert_eq!(meta.tracks[0].track_number, 1);
+        assert_eq!(meta.tracks[0].title, "Prologue");
+        assert_eq!(meta.tracks[0].duration, "1:45");
+        assert_eq!(meta.tracks[1].disc_number, 1);
+        assert_eq!(meta.tracks[1].track_number, 2);
+        assert_eq!(meta.tracks[1].title, "Theme of Zill O'll");
+        assert_eq!(meta.tracks[2].disc_number, 2);
+        assert_eq!(meta.tracks[2].track_number, 1);
+        assert_eq!(meta.tracks[2].title, "Drama Chapter 1");
     }
 }

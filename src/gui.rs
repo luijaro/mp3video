@@ -22,7 +22,7 @@ use windows_sys::Win32::System::Com::{
     CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
 };
 use windows_sys::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
@@ -104,6 +104,7 @@ const ID_BTN_SPLIT_CUE_MP3: usize = 113;
 const ID_BTN_COPY_TIMESTAMPS: usize = 114;
 const ID_CHK_FULL_ALBUM: usize = 115;
 const ID_BTN_VGMDB_JSON: usize = 116;
+const ID_BTN_VGMDB_PASTE: usize = 117;
 
 const RESOLUTIONS: &[(&str, (u32, u32))] = &[
     ("1920x1080 (Full HD 16:9)", (1920, 1080)),
@@ -253,6 +254,7 @@ struct GuiState {
     chk_recursive: HWND,
     chk_overwrite: HWND,
     edit_vgmdb_code: HWND,
+    btn_vgmdb_paste: HWND,
     btn_vgmdb_search: HWND,
     btn_vgmdb_json: HWND,
     lbl_vgmdb_info: HWND,
@@ -311,6 +313,7 @@ impl GuiState {
             chk_recursive: null_mut(),
             chk_overwrite: null_mut(),
             edit_vgmdb_code: null_mut(),
+            btn_vgmdb_paste: null_mut(),
             btn_vgmdb_search: null_mut(),
             btn_vgmdb_json: null_mut(),
             lbl_vgmdb_info: null_mut(),
@@ -350,7 +353,7 @@ impl GuiState {
         (logical_px * self.dpi + 48) / 96
     }
 
-    fn editable_controls(&self) -> [HWND; 34] {
+    fn editable_controls(&self) -> [HWND; 35] {
         [
             self.edit_input,
             self.btn_browse_input_dir,
@@ -369,6 +372,7 @@ impl GuiState {
             self.chk_recursive,
             self.chk_overwrite,
             self.edit_vgmdb_code,
+            self.btn_vgmdb_paste,
             self.btn_vgmdb_search,
             self.btn_vgmdb_json,
             self.edit_album,
@@ -799,6 +803,33 @@ fn copy_text_to_clipboard(hwnd: HWND, text: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn read_text_from_clipboard(hwnd: HWND) -> Option<String> {
+    unsafe {
+        if OpenClipboard(hwnd) == 0 {
+            return None;
+        }
+        let hmem = GetClipboardData(CF_UNICODETEXT as u32);
+        if hmem.is_null() {
+            CloseClipboard();
+            return None;
+        }
+        let ptr = GlobalLock(hmem) as *const u16;
+        if ptr.is_null() {
+            CloseClipboard();
+            return None;
+        }
+        let mut len = 0;
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(ptr, len);
+        let text = String::from_utf16_lossy(slice);
+        GlobalUnlock(hmem);
+        CloseClipboard();
+        Some(text)
+    }
 }
 
 fn apply_loaded_cue_to_ui(
@@ -1371,12 +1402,12 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
     create_child(
         hwnd,
         "STATIC",
-        "Código / ID:",
+        "Catálogo / URL:",
         0,
         0,
         state.px(28),
         state.px(261),
-        state.px(88),
+        state.px(90),
         state.px(18),
         0,
         f_reg,
@@ -1389,9 +1420,22 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         WS_EX_CLIENTEDGE,
         state.px(120),
         state.px(258),
-        state.px(175),
+        state.px(170),
         state.px(23),
         0,
+        f_reg,
+    );
+    state.btn_vgmdb_paste = create_child(
+        hwnd,
+        "BUTTON",
+        "📋 Pegar URL",
+        BS_PUSHBUTTON as u32 | WS_TABSTOP,
+        0,
+        state.px(295),
+        state.px(258),
+        state.px(95),
+        state.px(23),
+        ID_BTN_VGMDB_PASTE,
         f_reg,
     );
     state.btn_vgmdb_search = create_child(
@@ -1400,9 +1444,9 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         "🔍 Buscar",
         BS_PUSHBUTTON as u32 | WS_TABSTOP,
         0,
-        state.px(301),
+        state.px(394),
         state.px(258),
-        state.px(110),
+        state.px(80),
         state.px(23),
         ID_BTN_VGMDB_SEARCH,
         f_reg,
@@ -1410,12 +1454,12 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
     state.btn_vgmdb_json = create_child(
         hwnd,
         "BUTTON",
-        "📂 Cargar JSON",
+        "📂 Cargar JSON / HTML",
         BS_PUSHBUTTON as u32 | WS_TABSTOP,
         0,
-        state.px(417),
+        state.px(478),
         state.px(258),
-        state.px(120),
+        state.px(148),
         state.px(23),
         ID_BTN_VGMDB_JSON,
         f_reg,
@@ -1423,12 +1467,12 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
     state.lbl_vgmdb_info = create_child(
         hwnd,
         "STATIC",
-        "Sin disco cargado (ej: SQEX-10001, KECH-1346~7)",
+        "Sin disco cargado (ej: SQEX-10001, KECH-1346~7 o https://vgmdb.net/album/10200)",
         0,
         0,
-        state.px(545),
+        state.px(632),
         state.px(261),
-        state.px(327),
+        state.px(242),
         state.px(16),
         0,
         f_small,
@@ -2150,7 +2194,7 @@ fn start_vgmdb_search(hwnd: HWND, state: &mut GuiState) {
         show_msg_box(
             hwnd,
             "Buscar en VGMdb",
-            "Ingresá un código de catálogo (ej: SQEX-10001) o ID de álbum de VGMdb.",
+            "Ingresá un código de catálogo (ej: SQEX-10001), una URL de VGMdb (ej: https://vgmdb.net/album/10200) o presioná '📋 Pegar URL'.",
             MB_OK | MB_ICONWARNING,
         );
         return;
@@ -2160,6 +2204,7 @@ fn start_vgmdb_search(hwnd: HWND, state: &mut GuiState) {
     state.is_searching = true;
     unsafe {
         EnableWindow(state.btn_vgmdb_search, 0);
+        EnableWindow(state.btn_vgmdb_paste, 0);
         EnableWindow(state.btn_vgmdb_json, 0);
     }
     set_window_text(state.lbl_vgmdb_info, "Consultando VGMdb / MusicBrainz...");
@@ -3463,7 +3508,7 @@ fn handle_drop_files(hwnd: HWND, state: &mut GuiState, hdrop: HDROP) {
             set_window_text(state.edit_image, &dropped);
             append_log(state.edit_log, &format!("Imagen seleccionada: {}", dropped));
             save_settings(state);
-        } else if path.is_file() && has_extension(&path, &["json"]) {
+        } else if path.is_file() && has_extension(&path, &["json", "html", "htm"]) {
             let content = fs::read_to_string(&path).unwrap_or_default();
             if content.contains("\"installed\"") || content.contains("\"web\"") {
                 set_window_text(state.edit_client_secret, &dropped);
@@ -3480,7 +3525,7 @@ fn handle_drop_files(hwnd: HWND, state: &mut GuiState, hdrop: HDROP) {
             show_msg_box(
                 hwnd,
                 "Archivo no compatible",
-                "Soltá una carpeta, .mp3, .cue, .flac, imagen o archivo .json.",
+                "Soltá una carpeta, .mp3, .cue, .flac, imagen o archivo .json / .html de VGMdb.",
                 MB_OK | MB_ICONWARNING,
             );
         }
@@ -3572,12 +3617,41 @@ fn handle_command(hwnd: HWND, state: &mut GuiState, cmd_id: usize) {
             }
         }
         ID_BTN_VGMDB_SEARCH => start_vgmdb_search(hwnd, state),
+        ID_BTN_VGMDB_PASTE => {
+            if let Some(text) = read_text_from_clipboard(hwnd) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    set_window_text(state.edit_vgmdb_code, trimmed);
+                    save_settings(state);
+                    append_log(
+                        state.edit_log,
+                        &format!("URL / código pegado del portapapeles: {}", trimmed),
+                    );
+                    start_vgmdb_search(hwnd, state);
+                }
+            } else {
+                show_msg_box(
+                    hwnd,
+                    "Portapapeles sin texto",
+                    "No se encontró texto en el portapapeles.\nCopiá una URL de VGMdb (ej: https://vgmdb.net/album/10200) o código de catálogo y volvé a presionar este botón.",
+                    MB_OK | MB_ICONINFORMATION,
+                );
+            }
+        }
         ID_BTN_VGMDB_JSON => {
             let current = get_window_text(state.edit_vgmdb_code);
             if let Some(file) = pick_file(
                 hwnd,
-                "Elegí un archivo JSON de VGMdb",
-                &[("Archivo JSON (*.json)", "*.json"), ("Todos (*.*)", "*.*")],
+                "Elegí un archivo JSON o página HTML guardada de VGMdb",
+                &[
+                    (
+                        "Archivos VGMdb (*.json; *.html; *.htm)",
+                        "*.json;*.html;*.htm",
+                    ),
+                    ("Archivos JSON (*.json)", "*.json"),
+                    ("Páginas HTML guardadas (*.html; *.htm)", "*.html;*.htm"),
+                    ("Todos los archivos (*.*)", "*.*"),
+                ],
                 &current,
             ) {
                 let path_str = file.to_string_lossy().to_string();
@@ -3819,6 +3893,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             if !state.is_running {
                 unsafe {
                     EnableWindow(state.btn_vgmdb_search, 1);
+                    EnableWindow(state.btn_vgmdb_paste, 1);
                     EnableWindow(state.btn_vgmdb_json, 1);
                 }
             }
