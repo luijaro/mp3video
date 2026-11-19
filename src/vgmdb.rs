@@ -9,8 +9,8 @@ use serde_json::Value;
 
 use crate::{find_ffprobe, new_hidden_command};
 
-const DEFAULT_VGMDB_BASE_URL: &str = "https://vgmdb.info";
 const MUSICBRAINZ_BASE_URL: &str = "https://musicbrainz.org/ws/2";
+const DISCOGS_BASE_URL: &str = "https://api.discogs.com";
 const USER_AGENT: &str = "mp3video/0.1.0 (https://github.com/luijaro/mp3video)";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -172,7 +172,7 @@ fn extract_vgmdb_people(arr: Option<&Value>) -> Vec<String> {
     result
 }
 
-fn parse_vgmdb_album_json(data: &Value, fallback_catalog: &str) -> Result<AlbumMetadata> {
+pub(crate) fn parse_vgmdb_album_json(data: &Value, fallback_catalog: &str) -> Result<AlbumMetadata> {
     let album_title = data
         .get("names")
         .and_then(pick_preferred_name)
@@ -456,7 +456,11 @@ pub(crate) fn extract_vgmdb_album_id(input: &str) -> Option<String> {
     }
 
     // Si es una URL o ruta con "album/<id>" (ej: "https://vgmdb.net/album/10200", "vgmdb.net/album/10200" o "album/10200")
-    if let Some(pos) = trimmed.find("album/") {
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("discogs.com") {
+        return None;
+    }
+    if let Some(pos) = lower.find("album/") {
         let after = &trimmed[pos + "album/".len()..];
         let id: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
         if !id.is_empty() {
@@ -465,6 +469,92 @@ pub(crate) fn extract_vgmdb_album_id(input: &str) -> Option<String> {
     }
 
     None
+}
+
+pub(crate) fn build_vgmdb_browser_url(query: &str) -> String {
+    if let Some(id) = extract_vgmdb_album_id(query) {
+        return format!("https://vgmdb.net/album/{}", id);
+    }
+    let trimmed = query.trim();
+    if !trimmed.is_empty() && !trimmed.contains('\n') && !trimmed.contains('\t') {
+        return format!("https://vgmdb.net/search?q={}", percent_encode(trimmed));
+    }
+    "https://vgmdb.net/".to_string()
+}
+
+pub(crate) fn extract_discogs_release_id(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.contains("discogs.com") {
+        return None;
+    }
+    if let Some(pos) = lower.find("/release/") {
+        let after = &trimmed[pos + "/release/".len()..];
+        let id: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !id.is_empty() {
+            return Some(id);
+        }
+    }
+    None
+}
+
+pub(crate) fn looks_like_vgmdb_html(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("<html")
+        || lower.contains("<!doctype html")
+        || lower.contains("id=\"album_infobit_large\"")
+        || lower.contains("id=\"tracklist\"")
+        || lower.contains("class=\"albumtitle\"")
+}
+
+pub(crate) fn looks_like_vgmdb_copied_text(text: &str) -> bool {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.len() < 3 {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    let numbered_lines = lines
+        .iter()
+        .filter(|l| parse_copied_track_line(l, &[]).is_some() || parse_copied_track_line_raw(l).is_some())
+        .count();
+
+    (lower.contains("catalog number")
+        && (lower.contains("tracklist") || lower.contains("release date") || lower.contains("disc 1")))
+        || (lower.contains("tracklist") && numbered_lines >= 2)
+        || (lower.contains("disc 1") && numbered_lines >= 2)
+}
+
+fn collapse_whitespace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_was_space = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !out.is_empty() && !last_was_space {
+                out.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_was_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn decode_html_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#039;", "'")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+        .replace("&#x27;", "'")
 }
 
 fn strip_html_tags(input: &str) -> String {
@@ -482,17 +572,6 @@ fn strip_html_tags(input: &str) -> String {
     decode_html_entities(&out)
 }
 
-fn decode_html_entities(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#039;", "'")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&nbsp;", " ")
-}
-
 fn extract_between<'a>(input: &'a str, start: &str, end: &str) -> Option<&'a str> {
     let start_idx = input.find(start)? + start.len();
     let rest = &input[start_idx..];
@@ -500,34 +579,593 @@ fn extract_between<'a>(input: &'a str, start: &str, end: &str) -> Option<&'a str
     Some(&rest[..end_idx])
 }
 
-fn extract_table_cell_after(html: &str, label: &str) -> Option<String> {
-    let pos = html.find(label)?;
-    let rest = &html[pos + label.len()..];
-    let td_start = rest.find("<td")?;
-    let content_start = rest[td_start..].find('>')? + td_start + 1;
-    let td_end = rest[content_start..].find("</td>")? + content_start;
-    let raw = &rest[content_start..td_end];
-    let clean = strip_html_tags(raw).trim().to_string();
-    if clean.is_empty() {
-        None
+fn remove_html_comments(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        if let Some(end) = rest[start + 4..].find("-->") {
+            rest = &rest[start + 4 + end + 3..];
+        } else {
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn remove_tag_blocks(html: &str, tag: &str) -> String {
+    let open_pat = format!("<{}", tag.to_ascii_lowercase());
+    let close_pat = format!("</{}", tag.to_ascii_lowercase());
+    let mut out = String::with_capacity(html.len());
+    let lower = html.to_ascii_lowercase();
+    let mut cursor = 0usize;
+
+    while let Some(rel_start) = lower[cursor..].find(&open_pat) {
+        let start = cursor + rel_start;
+        // Verify tag boundary
+        let after_name = start + open_pat.len();
+        if after_name < lower.len() {
+            let next_ch = lower.as_bytes()[after_name];
+            if !matches!(next_ch, b'>' | b' ' | b'\t' | b'\r' | b'\n' | b'/') {
+                out.push_str(&html[cursor..after_name]);
+                cursor = after_name;
+                continue;
+            }
+        }
+        out.push_str(&html[cursor..start]);
+        if let Some(rel_close) = lower[after_name..].find(&close_pat) {
+            let close_start = after_name + rel_close;
+            if let Some(rel_end) = lower[close_start..].find('>') {
+                cursor = close_start + rel_end + 1;
+                continue;
+            }
+        }
+        return out;
+    }
+    out.push_str(&html[cursor..]);
+    out
+}
+
+fn remove_elements_matching(html: &str, tag: &str, attr_substr: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let open_pat = format!("<{}", tag.to_ascii_lowercase());
+    let close_pat = format!("</{}", tag.to_ascii_lowercase());
+    let attr_lower = attr_substr.to_ascii_lowercase();
+
+    let mut out = String::with_capacity(html.len());
+    let mut cursor = 0usize;
+
+    while let Some(rel_start) = lower[cursor..].find(&open_pat) {
+        let start = cursor + rel_start;
+        let after_name = start + open_pat.len();
+        if after_name < lower.len() {
+            let next_ch = lower.as_bytes()[after_name];
+            if !matches!(next_ch, b'>' | b' ' | b'\t' | b'\r' | b'\n' | b'/') {
+                out.push_str(&html[cursor..after_name]);
+                cursor = after_name;
+                continue;
+            }
+        }
+        let Some(rel_gt) = lower[start..].find('>') else {
+            break;
+        };
+        let tag_end = start + rel_gt + 1;
+        let open_tag_lower = &lower[start..tag_end];
+        if !open_tag_lower.contains(&attr_lower) {
+            out.push_str(&html[cursor..tag_end]);
+            cursor = tag_end;
+            continue;
+        }
+
+        out.push_str(&html[cursor..start]);
+        // Self-closing tag check
+        if lower[start..tag_end - 1].trim_end().ends_with('/') {
+            cursor = tag_end;
+            continue;
+        }
+
+        // Skip nested <tag> ... </tag> matching depth
+        let mut depth = 1usize;
+        let mut scan = tag_end;
+        while depth > 0 && scan < lower.len() {
+            let next_open = lower[scan..].find(&open_pat).map(|o| scan + o);
+            let next_close = lower[scan..].find(&close_pat).map(|c| scan + c);
+            match (next_open, next_close) {
+                (_, None) => {
+                    scan = lower.len();
+                    break;
+                }
+                (Some(o), Some(c)) if o < c => {
+                    let after = o + open_pat.len();
+                    let is_boundary = after >= lower.len()
+                        || matches!(
+                            lower.as_bytes()[after],
+                            b'>' | b' ' | b'\t' | b'\r' | b'\n' | b'/'
+                        );
+                    if let Some(rel_end) = lower[o..].find('>') {
+                        let full_end = o + rel_end + 1;
+                        let self_closing = lower[o..full_end - 1].trim_end().ends_with('/');
+                        if is_boundary && !self_closing {
+                            depth += 1;
+                        }
+                        scan = full_end;
+                    } else {
+                        scan = lower.len();
+                    }
+                }
+                (_, Some(c)) => {
+                    let after = c + close_pat.len();
+                    let is_boundary = after >= lower.len()
+                        || matches!(lower.as_bytes()[after], b'>' | b' ' | b'\t' | b'\r' | b'\n');
+                    if let Some(rel_end) = lower[c..].find('>') {
+                        if is_boundary {
+                            depth = depth.saturating_sub(1);
+                        }
+                        scan = c + rel_end + 1;
+                    } else {
+                        scan = lower.len();
+                    }
+                }
+            }
+        }
+        cursor = scan;
+    }
+
+    out.push_str(&html[cursor..]);
+    out
+}
+
+fn strip_vgmdb_hidden_markup(html: &str) -> String {
+    let s = remove_elements_matching(html, "div", "vbmenu_popup");
+    let s = remove_elements_matching(&s, "span", "display:none");
+    remove_elements_matching(&s, "span", "display: none")
+}
+
+fn parse_attr_value(tag_lower: &str, tag_orig: &str, attr_name: &str) -> Option<String> {
+    let eq_pat = format!("{}=", attr_name.to_ascii_lowercase());
+    let pos = tag_lower.find(&eq_pat)? + eq_pat.len();
+    let rest = &tag_orig[pos..];
+    let rest_trim = rest.trim_start();
+    let first = rest_trim.chars().next()?;
+    if first == '"' || first == '\'' {
+        let inner = &rest_trim[1..];
+        let end = inner.find(first)?;
+        Some(inner[..end].trim().to_string())
     } else {
-        Some(clean)
+        let val: String = rest_trim
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '>')
+            .collect();
+        (!val.is_empty()).then_some(val)
     }
 }
 
+fn select_vgmdb_tracklist_block<'a>(html: &'a str) -> &'a str {
+    let lower = html.to_ascii_lowercase();
+
+    // Parse #tlnav language tabs: <ul id="tlnav">...<a ... rel='tl1033'>English</a>...</ul>
+    let mut tabs: Vec<(String, String)> = Vec::new();
+    if let Some(nav_pos) = lower.find("id=\"tlnav\"").or_else(|| lower.find("id='tlnav'")) {
+        if let Some(rel_ul_end) = lower[nav_pos..].find("</ul>") {
+            let nav_orig = &html[nav_pos..nav_pos + rel_ul_end];
+            let nav_lower = &lower[nav_pos..nav_pos + rel_ul_end];
+            let mut scan = 0usize;
+            while let Some(rel_a) = nav_lower[scan..].find("<a ") {
+                let a_start = scan + rel_a;
+                let Some(rel_gt) = nav_lower[a_start..].find('>') else {
+                    break;
+                };
+                let tag_end = a_start + rel_gt + 1;
+                let Some(rel_close) = nav_lower[tag_end..].find("</a>") else {
+                    break;
+                };
+                let rel_id = parse_attr_value(
+                    &nav_lower[a_start..tag_end],
+                    &nav_orig[a_start..tag_end],
+                    "rel",
+                );
+                let label = collapse_whitespace(&strip_html_tags(&nav_orig[tag_end..tag_end + rel_close]));
+                if let Some(id) = rel_id {
+                    tabs.push((id, label));
+                }
+                scan = tag_end + rel_close + 4;
+            }
+        }
+    }
+
+    let preferred_tab_id = tabs
+        .iter()
+        .max_by_key(|(_, label)| {
+            let l = label.to_ascii_lowercase();
+            if l.contains("english") || l == "en" {
+                4
+            } else if l.contains("romaji") || l.contains("ja-latn") {
+                3
+            } else if l.contains("japanese") || l == "ja" {
+                2
+            } else {
+                1
+            }
+        })
+        .map(|(id, _)| id.clone());
+
+    let tl_start = lower
+        .find("id=\"tracklist\"")
+        .or_else(|| lower.find("id='tracklist'"));
+
+    let region = if let Some(start) = tl_start {
+        let tail_lower = &lower[start..];
+        let end_rel = tail_lower
+            .find("<h3>notes")
+            .or_else(|| tail_lower.find("id=\"collapse_notes\""))
+            .or_else(|| tail_lower.find("id=\"rightcolumn\""))
+            .unwrap_or(tail_lower.len());
+        &html[start..start + end_rel]
+    } else {
+        html
+    };
+
+    let region_lower = region.to_ascii_lowercase();
+    if let Some(tab_id) = preferred_tab_id {
+        let id_dq = format!("id=\"{}\"", tab_id.to_ascii_lowercase());
+        let id_sq = format!("id='{}'", tab_id.to_ascii_lowercase());
+        if let Some(tab_pos) = region_lower.find(&id_dq).or_else(|| region_lower.find(&id_sq)) {
+            let after_tab = tab_pos + id_dq.len().min(region.len() - tab_pos);
+            let next_tab_rel = region_lower[after_tab..]
+                .find("<span class=\"tl\"")
+                .or_else(|| region_lower[after_tab..].find("<span class='tl'"));
+            return if let Some(rel_end) = next_tab_rel {
+                &region[tab_pos..after_tab + rel_end]
+            } else {
+                &region[tab_pos..]
+            };
+        }
+    }
+
+    // Si hay múltiples <span class="tl" sin #tlnav, tomar solo el primero
+    if let Some(first_tl) = region_lower
+        .find("<span class=\"tl\"")
+        .or_else(|| region_lower.find("<span class='tl'"))
+    {
+        let after = first_tl + 16;
+        if let Some(second_rel) = region_lower[after..]
+            .find("<span class=\"tl\"")
+            .or_else(|| region_lower[after..].find("<span class='tl'"))
+        {
+            return &region[first_tl..after + second_rel];
+        }
+        return &region[first_tl..];
+    }
+
+    region
+}
+
+fn extract_td_cells_in_tr(tr_html: &str) -> Vec<String> {
+    let lower = tr_html.to_ascii_lowercase();
+    let mut cells = Vec::new();
+    let mut scan = 0usize;
+    while let Some(rel_td) = lower[scan..].find("<td") {
+        let td_start = scan + rel_td;
+        let after_td = td_start + 3;
+        if after_td < lower.len()
+            && !matches!(
+                lower.as_bytes()[after_td],
+                b'>' | b' ' | b'\t' | b'\r' | b'\n'
+            )
+        {
+            scan = after_td;
+            continue;
+        }
+        let Some(rel_gt) = lower[td_start..].find('>') else {
+            break;
+        };
+        let content_start = td_start + rel_gt + 1;
+        let Some(rel_close) = lower[content_start..].find("</td>") else {
+            break;
+        };
+        let raw_cell = &tr_html[content_start..content_start + rel_close];
+        cells.push(collapse_whitespace(&strip_html_tags(raw_cell)));
+        scan = content_start + rel_close + 5;
+    }
+    cells
+}
+
+fn parse_disc_header_number(text: &str) -> Option<u32> {
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let after = if lower.starts_with("disc ") {
+        trimmed[5..].trim_start()
+    } else if lower.starts_with("cd ") {
+        trimmed[3..].trim_start()
+    } else if lower.starts_with("cd") && trimmed[2..].starts_with(|c: char| c.is_ascii_digit()) {
+        trimmed[2..].trim_start()
+    } else {
+        return None;
+    };
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let num = digits.parse::<u32>().ok()?;
+    (num > 0 && num <= 99).then_some(num)
+}
+
+fn parse_vgmdb_tracklist_html(tab_html: &str, composers: &[String]) -> Vec<TrackInfo> {
+    let cleaned = strip_vgmdb_hidden_markup(tab_html);
+    let lower = cleaned.to_ascii_lowercase();
+    let mut tracks = Vec::new();
+    let mut current_disc = 1u32;
+    let mut current_track = 1u32;
+
+    let mut scan = 0usize;
+    while scan < lower.len() {
+        let next_b = lower[scan..].find("<b>").or_else(|| lower[scan..].find("<b "));
+        let next_tr = lower[scan..].find("<tr");
+
+        let b_rel_opt = match (next_b, next_tr) {
+            (None, None) => break,
+            (Some(b), Some(t)) if b < t => Some(b),
+            (Some(b), None) => Some(b),
+            _ => None,
+        };
+
+        if let Some(b_rel) = b_rel_opt {
+            let b_start = scan + b_rel;
+            let Some(rel_gt) = lower[b_start..].find('>') else {
+                break;
+            };
+            let content_start = b_start + rel_gt + 1;
+            if let Some(rel_close) = lower[content_start..].find("</b>") {
+                let b_text = collapse_whitespace(&strip_html_tags(
+                    &cleaned[content_start..content_start + rel_close],
+                ));
+                if let Some(d) = parse_disc_header_number(&b_text) {
+                    current_disc = d;
+                    current_track = 1;
+                }
+                scan = content_start + rel_close + 4;
+            } else {
+                scan = content_start;
+            }
+        } else if let Some(tr_rel) = next_tr {
+            let tr_start = scan + tr_rel;
+            let Some(rel_gt) = lower[tr_start..].find('>') else {
+                break;
+            };
+            let tr_tag_end = tr_start + rel_gt + 1;
+            let tr_open_lower = &lower[tr_start..tr_tag_end];
+            let Some(rel_close) = lower[tr_tag_end..].find("</tr>") else {
+                break;
+            };
+            let tr_inner = &cleaned[tr_tag_end..tr_tag_end + rel_close];
+            scan = tr_tag_end + rel_close + 5;
+
+            if !tr_open_lower.contains("rolebit") {
+                continue;
+            }
+
+            let cells = extract_td_cells_in_tr(tr_inner);
+            if cells.len() >= 2 {
+                let num_digits: String =
+                    cells[0].chars().take_while(|c| c.is_ascii_digit()).collect();
+                let title = cells[1].trim().to_string();
+                if title.is_empty() {
+                    continue;
+                }
+                let track_number = num_digits
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .unwrap_or(current_track);
+                let raw_dur = cells.get(2).map(String::as_str).unwrap_or("").trim();
+                let duration = if raw_dur.eq_ignore_ascii_case("unknown") || raw_dur == "-" {
+                    String::new()
+                } else {
+                    raw_dur.to_string()
+                };
+
+                tracks.push(TrackInfo {
+                    disc_number: current_disc,
+                    track_number,
+                    title,
+                    duration,
+                    composers: composers.to_vec(),
+                });
+                current_track = track_number + 1;
+            }
+        }
+    }
+
+    if !tracks.is_empty() {
+        return tracks;
+    }
+
+    // Fallback 1: <tr> con 3 celdas donde la celda 0 es número de pista
+    let mut fallback_disc = 1u32;
+    let mut fallback_scan = 0usize;
+    while let Some(tr_rel) = lower[fallback_scan..].find("<tr") {
+        let tr_start = fallback_scan + tr_rel;
+        let Some(rel_gt) = lower[tr_start..].find('>') else {
+            break;
+        };
+        let tr_tag_end = tr_start + rel_gt + 1;
+        let Some(rel_close) = lower[tr_tag_end..].find("</tr>") else {
+            break;
+        };
+        let tr_inner = &cleaned[tr_tag_end..tr_tag_end + rel_close];
+        fallback_scan = tr_tag_end + rel_close + 5;
+        let cells = extract_td_cells_in_tr(tr_inner);
+        if cells.len() >= 3
+            && !cells[0].is_empty()
+            && cells[0].chars().all(|c| c.is_ascii_digit())
+            && !cells[1].is_empty()
+        {
+            if let Ok(n) = cells[0].parse::<u32>() {
+                let raw_dur = cells[2].trim();
+                let duration = if raw_dur.eq_ignore_ascii_case("unknown") || raw_dur == "-" {
+                    String::new()
+                } else {
+                    raw_dur.to_string()
+                };
+                tracks.push(TrackInfo {
+                    disc_number: fallback_disc,
+                    track_number: n,
+                    title: cells[1].clone(),
+                    duration,
+                    composers: composers.to_vec(),
+                });
+            }
+        } else if cells.len() == 1 {
+            if let Some(d) = parse_disc_header_number(&cells[0]) {
+                fallback_disc = d;
+            }
+        }
+    }
+    if !tracks.is_empty() {
+        return tracks;
+    }
+
+    // Fallback 2: formato simple con class="trackname" y class="time"
+    let mut legacy_disc = 1u32;
+    let mut legacy_track = 1u32;
+    for line in cleaned.lines() {
+        let trimmed_line = line.trim();
+        if (trimmed_line.contains("Disc ") || trimmed_line.contains("CD "))
+            && (trimmed_line.contains("<span")
+                || trimmed_line.contains("<td")
+                || trimmed_line.contains("<b"))
+        {
+            if let Some(pos) = trimmed_line.find("Disc ").or_else(|| trimmed_line.find("CD ")) {
+                let after = trimmed_line[pos + 4..].trim_start();
+                let num_digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(d) = num_digits.parse::<u32>() {
+                    if d > 0 {
+                        legacy_disc = d;
+                        legacy_track = 1;
+                    }
+                }
+            }
+        }
+
+        if trimmed_line.contains("class=\"trackname\"") || trimmed_line.contains("class='trackname'")
+        {
+            let title = extract_between(trimmed_line, "class=\"trackname\"", "</span>")
+                .or_else(|| extract_between(trimmed_line, "class='trackname'", "</span>"))
+                .map(|s| {
+                    let inside = s.find('>').map(|i| &s[i + 1..]).unwrap_or(s);
+                    collapse_whitespace(&strip_html_tags(inside))
+                })
+                .unwrap_or_default();
+
+            if !title.is_empty() {
+                let duration = extract_between(trimmed_line, "class=\"time\"", "</span>")
+                    .or_else(|| extract_between(trimmed_line, "class='time'", "</span>"))
+                    .map(|s| {
+                        let inside = s.find('>').map(|i| &s[i + 1..]).unwrap_or(s);
+                        collapse_whitespace(&strip_html_tags(inside))
+                    })
+                    .unwrap_or_default();
+
+                tracks.push(TrackInfo {
+                    disc_number: legacy_disc,
+                    track_number: legacy_track,
+                    title,
+                    duration,
+                    composers: composers.to_vec(),
+                });
+                legacy_track += 1;
+            }
+        }
+    }
+
+    tracks
+}
+
+fn split_people_list(raw: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut paren_depth = 0usize;
+
+    for ch in raw.chars() {
+        match ch {
+            '(' => {
+                paren_depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' | '/' if paren_depth == 0 => {
+                let clean = current.trim().to_string();
+                if !clean.is_empty() {
+                    push_unique(&mut result, clean);
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    let clean = current.trim().to_string();
+    if !clean.is_empty() {
+        push_unique(&mut result, clean);
+    }
+    result
+}
+
+fn clean_vgmdb_publisher(raw: &str) -> String {
+    let trimmed = collapse_whitespace(raw);
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // Ej: "KOEI Co., Ltd. (Publisher), Universal Music (Distributor)" -> "KOEI Co., Ltd."
+    let first = trimmed.split("),").next().unwrap_or(&trimmed).trim();
+    if let Some(paren_idx) = first.rfind(" (") {
+        let role_hint = first[paren_idx..].to_ascii_lowercase();
+        if role_hint.contains("publish")
+            || role_hint.contains("label")
+            || role_hint.contains("distribut")
+            || role_hint.contains("manufactur")
+            || role_hint.contains("retail")
+        {
+            return first[..paren_idx].trim().to_string();
+        }
+    }
+    first.trim_end_matches('/').trim().to_string()
+}
+
 pub(crate) fn parse_vgmdb_html(html: &str, fallback_catalog: &str) -> Result<AlbumMetadata> {
-    // 1. Título del álbum
+    let no_scripts = remove_html_comments(&remove_tag_blocks(&remove_tag_blocks(html, "script"), "style"));
+
+    // 1. Extraer tracklist ANTES de eliminar spans display:none (en algunas páginas la pestaña English puede estar oculta)
+    let tracklist_region = select_vgmdb_tracklist_block(&no_scripts);
+
+    // 2. Limpiar elementos ocultos y popups para extraer metadatos visibles en inglés
+    let visible = strip_vgmdb_hidden_markup(&no_scripts);
+    let visible_lower = visible.to_ascii_lowercase();
+
+    // 3. Título del álbum
     let mut album_title = None;
-    if let Some(span) = extract_between(html, "class=\"albumtitle\"", "</span>") {
-        let after_tag = span.find('>').map(|i| &span[i + 1..]).unwrap_or(span);
-        let clean = strip_html_tags(after_tag).trim().to_string();
-        if !clean.is_empty() {
-            album_title = Some(clean);
+    if let Some(h1_start) = visible_lower.find("<h1") {
+        if let Some(h1_end_rel) = visible_lower[h1_start..].find("</h1>") {
+            let h1_html = &visible[h1_start..h1_start + h1_end_rel];
+            let h1_text = collapse_whitespace(&strip_html_tags(h1_html));
+            let clean = h1_text.trim_matches(['/', ' ']).trim().to_string();
+            if !clean.is_empty() {
+                album_title = Some(clean);
+            }
         }
     }
     if album_title.is_none() {
-        if let Some(title_tag) = extract_between(html, "<title>", "</title>") {
-            let clean = strip_html_tags(title_tag);
+        if let Some(span) = extract_between(&visible, "class=\"albumtitle\"", "</span>") {
+            let after_tag = span.find('>').map(|i| &span[i + 1..]).unwrap_or(span);
+            let clean = collapse_whitespace(&strip_html_tags(after_tag));
+            if !clean.is_empty() {
+                album_title = Some(clean);
+            }
+        }
+    }
+    if album_title.is_none() {
+        if let Some(title_tag) = extract_between(&visible, "<title>", "</title>") {
+            let clean = collapse_whitespace(&strip_html_tags(title_tag));
             let without_vgmdb = clean.trim_end_matches("- VGMdb").trim();
             if let Some((_, right)) = without_vgmdb.split_once('|') {
                 let t = right.trim().to_string();
@@ -542,12 +1180,95 @@ pub(crate) fn parse_vgmdb_html(html: &str, fallback_catalog: &str) -> Result<Alb
     let album_title = album_title
         .context("No se pudo encontrar el título del álbum en el HTML de VGMdb")?;
 
-    // 2. Código de catálogo
-    let mut catalog = extract_table_cell_after(html, "Catalog Number")
-        .unwrap_or_else(|| fallback_catalog.to_string());
+    // 4. Escanear filas <tr> del bloque de información y créditos (antes del tracklist)
+    let meta_end = visible_lower
+        .find("id=\"tracklist\"")
+        .or_else(|| visible_lower.find("id='tracklist'"))
+        .unwrap_or(visible.len());
+    let meta_html = &visible[..meta_end];
+    let meta_lower = &visible_lower[..meta_end];
+
+    let mut catalog = String::new();
+    let mut release_date = String::new();
+    let mut publisher = String::new();
+    let mut label_fallback = String::new();
+    let mut composers = Vec::new();
+    let mut arrangers = Vec::new();
+    let mut performers = Vec::new();
+    let mut lyricists = Vec::new();
+
+    let mut scan = 0usize;
+    while let Some(tr_rel) = meta_lower[scan..].find("<tr") {
+        let tr_start = scan + tr_rel;
+        let Some(rel_gt) = meta_lower[tr_start..].find('>') else {
+            break;
+        };
+        let tr_inner_start = tr_start + rel_gt + 1;
+        let Some(rel_close) = meta_lower[tr_inner_start..].find("</tr>") else {
+            break;
+        };
+        let tr_inner = &meta_html[tr_inner_start..tr_inner_start + rel_close];
+        scan = tr_inner_start + rel_close + 5;
+
+        let cells = extract_td_cells_in_tr(tr_inner);
+        if cells.len() < 2 {
+            continue;
+        }
+        let key = cells[0].trim().to_ascii_lowercase();
+        let val = cells[1].trim();
+        if val.is_empty() {
+            continue;
+        }
+
+        if key == "catalog number" && catalog.is_empty() {
+            let main_cat = val.split('(').next().unwrap_or(val).trim();
+            if !main_cat.is_empty() && !main_cat.eq_ignore_ascii_case("n/a") {
+                catalog = main_cat.to_string();
+            }
+        } else if key == "release date" && release_date.is_empty() {
+            release_date = val.to_string();
+        } else if (key == "publisher" || key == "publish organization" || key == "published by")
+            && publisher.is_empty()
+        {
+            publisher = clean_vgmdb_publisher(val);
+        } else if (key == "label" || key == "organizations") && label_fallback.is_empty() {
+            label_fallback = clean_vgmdb_publisher(val);
+        } else if matches!(
+            key.as_str(),
+            "composer"
+                | "composed by"
+                | "all composed by"
+                | "all music composed by"
+                | "music"
+        ) {
+            for person in split_people_list(val) {
+                push_unique(&mut composers, person);
+            }
+        } else if matches!(
+            key.as_str(),
+            "arranger" | "arranged by" | "all arranged by" | "all music arranged by"
+        ) {
+            for person in split_people_list(val) {
+                push_unique(&mut arrangers, person);
+            }
+        } else if matches!(key.as_str(), "performer" | "performed by" | "vocals") {
+            for person in split_people_list(val) {
+                push_unique(&mut performers, person);
+            }
+        } else if matches!(key.as_str(), "lyricist" | "lyrics by") {
+            for person in split_people_list(val) {
+                push_unique(&mut lyricists, person);
+            }
+        }
+    }
+
+    if publisher.is_empty() {
+        publisher = label_fallback;
+    }
+
     if catalog.is_empty() {
-        if let Some(title_tag) = extract_between(html, "<title>", "</title>") {
-            let clean = strip_html_tags(title_tag);
+        if let Some(title_tag) = extract_between(&visible, "<title>", "</title>") {
+            let clean = collapse_whitespace(&strip_html_tags(title_tag));
             if let Some((left, _)) = clean.split_once('|') {
                 let cat = left.trim();
                 if !cat.is_empty() {
@@ -556,82 +1277,12 @@ pub(crate) fn parse_vgmdb_html(html: &str, fallback_catalog: &str) -> Result<Alb
             }
         }
     }
-
-    // 3. Fecha de lanzamiento
-    let release_date = extract_table_cell_after(html, "Release Date").unwrap_or_default();
-
-    // 4. Publicador / Organización
-    let publisher = extract_table_cell_after(html, "Publish Organization")
-        .or_else(|| extract_table_cell_after(html, "Publisher"))
-        .or_else(|| extract_table_cell_after(html, "Organizations"))
-        .unwrap_or_default();
-
-    // 5. Compositores
-    let mut composers = Vec::new();
-    if let Some(comp_str) = extract_table_cell_after(html, "Composed by")
-        .or_else(|| extract_table_cell_after(html, "Composer"))
-    {
-        for part in comp_str.split([',', '/']) {
-            let clean = part.trim().to_string();
-            if !clean.is_empty() && !composers.contains(&clean) {
-                composers.push(clean);
-            }
-        }
+    if catalog.is_empty() {
+        catalog = fallback_catalog.trim().to_string();
     }
 
-    // 6. Pistas
-    let mut tracks = Vec::new();
-    let mut current_disc = 1u32;
-    let mut current_track = 1u32;
-
-    for line in html.lines() {
-        let trimmed_line = line.trim();
-        if (trimmed_line.contains("Disc ") || trimmed_line.contains("CD "))
-            && (trimmed_line.contains("<span")
-                || trimmed_line.contains("<td")
-                || trimmed_line.contains("<b"))
-        {
-            if let Some(pos) = trimmed_line.find("Disc ").or_else(|| trimmed_line.find("CD ")) {
-                let after = &trimmed_line[pos + 4..].trim_start();
-                let num_digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if let Ok(d) = num_digits.parse::<u32>() {
-                    if d > 0 {
-                        current_disc = d;
-                        current_track = 1;
-                    }
-                }
-            }
-        }
-
-        if trimmed_line.contains("class=\"trackname\"") || trimmed_line.contains("class='trackname'") {
-            let title = extract_between(trimmed_line, "class=\"trackname\"", "</span>")
-                .or_else(|| extract_between(trimmed_line, "class='trackname'", "</span>"))
-                .map(|s| {
-                    let inside = s.find('>').map(|i| &s[i + 1..]).unwrap_or(s);
-                    strip_html_tags(inside).trim().to_string()
-                })
-                .unwrap_or_default();
-
-            if !title.is_empty() {
-                let duration = extract_between(trimmed_line, "class=\"time\"", "</span>")
-                    .or_else(|| extract_between(trimmed_line, "class='time'", "</span>"))
-                    .map(|s| {
-                        let inside = s.find('>').map(|i| &s[i + 1..]).unwrap_or(s);
-                        strip_html_tags(inside).trim().to_string()
-                    })
-                    .unwrap_or_default();
-
-                tracks.push(TrackInfo {
-                    disc_number: current_disc,
-                    track_number: current_track,
-                    title,
-                    duration,
-                    composers: composers.clone(),
-                });
-                current_track += 1;
-            }
-        }
-    }
+    // 5. Pistas desde la pestaña elegida
+    let tracks = parse_vgmdb_tracklist_html(tracklist_region, &composers);
 
     Ok(AlbumMetadata {
         source: "VGMdb (HTML)".to_string(),
@@ -640,11 +1291,709 @@ pub(crate) fn parse_vgmdb_html(html: &str, fallback_catalog: &str) -> Result<Alb
         release_date,
         publisher,
         composers,
-        arrangers: Vec::new(),
-        performers: Vec::new(),
-        lyricists: Vec::new(),
+        arrangers,
+        performers,
+        lyricists,
         tracks,
     })
+}
+
+fn is_valid_duration_token(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() || t.len() > 10 {
+        return false;
+    }
+    let parts: Vec<&str> = t.split(':').collect();
+    if parts.len() != 2 && parts.len() != 3 {
+        return false;
+    }
+    let last_ok = parts.last().is_some_and(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_digit()));
+    let others_ok = parts[..parts.len() - 1]
+        .iter()
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    last_ok && others_ok
+}
+
+fn parse_copied_track_line_raw(line: &str) -> Option<(u32, String, String)> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Formato 1: separado por tabulaciones ("01\tOpening\t2:14" o "01\tOpening")
+    if trimmed.contains('\t') {
+        let cols: Vec<&str> = trimmed.split('\t').map(str::trim).collect();
+        if cols.len() >= 2 && !cols[0].is_empty() && cols[0].len() <= 3 && cols[0].chars().all(|c| c.is_ascii_digit()) {
+            let track_num: u32 = cols[0].parse().ok()?;
+            if track_num == 0 {
+                return None;
+            }
+            let last = *cols.last().unwrap_or(&"");
+            let (title_cols, duration) = if cols.len() >= 3 && (is_valid_duration_token(last) || last.eq_ignore_ascii_case("unknown")) {
+                let dur = if last.eq_ignore_ascii_case("unknown") { String::new() } else { last.to_string() };
+                (&cols[1..cols.len() - 1], dur)
+            } else {
+                (&cols[1..], String::new())
+            };
+            let title = collapse_whitespace(&title_cols.join(" "));
+            if !title.is_empty() {
+                return Some((track_num, title, duration));
+            }
+        }
+    }
+
+    // Formato 2: "01 Opening 2:14" o "01. Opening 2:14"
+    let num_len = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if (1..=3).contains(&num_len) && trimmed.len() > num_len {
+        let rest_after_num = &trimmed[num_len..];
+        let sep_len = if rest_after_num.starts_with(". ") || rest_after_num.starts_with(") ") || rest_after_num.starts_with(".\t") {
+            2
+        } else if rest_after_num.starts_with(' ') || rest_after_num.starts_with('\t') {
+            1
+        } else {
+            0
+        };
+        if sep_len > 0 {
+            let track_num: u32 = trimmed[..num_len].parse().ok()?;
+            if track_num == 0 {
+                return None;
+            }
+            let body = rest_after_num[sep_len..].trim();
+            if let Some(last_ws) = body.rfind(char::is_whitespace) {
+                let candidate_dur = body[last_ws..].trim();
+                let candidate_title = body[..last_ws].trim();
+                if !candidate_title.is_empty() && is_valid_duration_token(candidate_dur) {
+                    return Some((track_num, collapse_whitespace(candidate_title), candidate_dur.to_string()));
+                }
+            }
+            // Formato 3: dos o más espacios tras el número sin duración ("01  Opening")
+            if rest_after_num.starts_with("  ") {
+                let clean_title = collapse_whitespace(body);
+                if !clean_title.is_empty() {
+                    return Some((track_num, clean_title, String::new()));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_copied_track_line(line: &str, composers: &[String]) -> Option<TrackInfo> {
+    parse_copied_track_line_raw(line).map(|(track_number, title, duration)| TrackInfo {
+        disc_number: 1,
+        track_number,
+        title,
+        duration,
+        composers: composers.to_vec(),
+    })
+}
+
+fn is_vgmdb_nav_or_chrome_line(line: &str) -> bool {
+    let lower = line.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "vgmdb"
+            | "albums"
+            | "artists"
+            | "labels"
+            | "products"
+            | "events"
+            | "forums"
+            | "radio"
+            | "login"
+            | "register"
+            | "search"
+            | "print"
+            | "edit"
+            | "bookmark"
+            | "report"
+            | "covers"
+            | "album"
+            | "add to collection"
+            | "credits"
+            | "tracklist"
+            | "notes"
+            | "album stats"
+            | "related albums"
+            | "available at"
+            | "websites"
+            | "entry stats"
+            | "/"
+            | "|"
+            | "-"
+    ) || lower.starts_with("logged in")
+        || lower.starts_with("forgot password")
+}
+
+pub(crate) fn parse_vgmdb_copied_text(raw: &str) -> Result<AlbumMetadata> {
+    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<&str> = normalized.lines().map(str::trim).collect();
+
+    let mut catalog = String::new();
+    let mut release_date = String::new();
+    let mut publisher = String::new();
+    let mut label_fallback = String::new();
+    let mut composers = Vec::new();
+    let mut arrangers = Vec::new();
+    let mut performers = Vec::new();
+    let mut lyricists = Vec::new();
+
+    let mut catalog_line_idx: Option<usize> = None;
+    let mut tracklist_line_idx: Option<usize> = None;
+
+    for (idx, &line) in lines.iter().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let lower_line = line.to_ascii_lowercase();
+        if lower_line == "tracklist" || lower_line.starts_with("tracklist\t") {
+            if tracklist_line_idx.is_none() {
+                tracklist_line_idx = Some(idx);
+            }
+            continue;
+        }
+
+        let kv = line
+            .split_once('\t')
+            .or_else(|| line.split_once(": "));
+        if let Some((raw_k, raw_v)) = kv {
+            let k = raw_k.trim().to_ascii_lowercase();
+            let v = raw_v.trim();
+            if v.is_empty() {
+                continue;
+            }
+            if k == "catalog number" {
+                if catalog_line_idx.is_none() {
+                    catalog_line_idx = Some(idx);
+                }
+                if catalog.is_empty() {
+                    let main_cat = v
+                        .split('\t')
+                        .next()
+                        .unwrap_or(v)
+                        .split('(')
+                        .next()
+                        .unwrap_or(v)
+                        .trim();
+                    if !main_cat.is_empty() && !main_cat.eq_ignore_ascii_case("n/a") {
+                        catalog = main_cat.to_string();
+                    }
+                }
+            } else if k == "release date" {
+                if catalog_line_idx.is_none() {
+                    catalog_line_idx = Some(idx);
+                }
+                if release_date.is_empty() {
+                    release_date = v.to_string();
+                }
+            } else if k == "barcode" && catalog_line_idx.is_none() {
+                catalog_line_idx = Some(idx);
+            } else if (k == "publisher" || k == "publish organization" || k == "published by")
+                && publisher.is_empty()
+            {
+                publisher = clean_vgmdb_publisher(v);
+            } else if (k == "label" || k == "organizations") && label_fallback.is_empty() {
+                label_fallback = clean_vgmdb_publisher(v);
+            } else if matches!(
+                k.as_str(),
+                "composer"
+                    | "composed by"
+                    | "all composed by"
+                    | "all music composed by"
+                    | "music"
+            ) {
+                for person in split_people_list(v) {
+                    push_unique(&mut composers, person);
+                }
+            } else if matches!(
+                k.as_str(),
+                "arranger" | "arranged by" | "all arranged by" | "all music arranged by"
+            ) {
+                for person in split_people_list(v) {
+                    push_unique(&mut arrangers, person);
+                }
+            } else if matches!(k.as_str(), "performer" | "performed by" | "vocals") {
+                for person in split_people_list(v) {
+                    push_unique(&mut performers, person);
+                }
+            } else if matches!(k.as_str(), "lyricist" | "lyrics by") {
+                for person in split_people_list(v) {
+                    push_unique(&mut lyricists, person);
+                }
+            }
+        }
+    }
+
+    if publisher.is_empty() {
+        publisher = label_fallback;
+    }
+
+    // Buscar título del álbum hacia atrás desde "Catalog Number" / "Release Date"
+    let mut album_title = String::new();
+    if let Some(meta_idx) = catalog_line_idx {
+        let mut candidates: Vec<&str> = Vec::new();
+        for i in (0..meta_idx).rev() {
+            let line = lines[i].trim();
+            if line.is_empty() {
+                continue;
+            }
+            if is_vgmdb_nav_or_chrome_line(line) {
+                if !candidates.is_empty() {
+                    break;
+                }
+                continue;
+            }
+            if !catalog.is_empty() && line.eq_ignore_ascii_case(&catalog) {
+                continue;
+            }
+            if line.contains('\t') {
+                if !candidates.is_empty() {
+                    break;
+                }
+                continue;
+            }
+            candidates.push(line);
+            if candidates.len() >= 3 {
+                break;
+            }
+        }
+        // candidates está en orden inverso (de abajo hacia arriba); preferir la primera línea latina de arriba
+        candidates.reverse();
+        if let Some(latin) = candidates.iter().find(|c| !has_non_ascii(c)) {
+            album_title = (*latin).to_string();
+        } else if let Some(first) = candidates.first() {
+            album_title = (*first).to_string();
+        }
+    }
+
+    if album_title.is_empty() {
+        if let Some(fallback_line) = lines.iter().find(|&&l| {
+            !l.is_empty()
+                && !is_vgmdb_nav_or_chrome_line(l)
+                && !l.contains('\t')
+                && parse_disc_header_number(l).is_none()
+                && parse_copied_track_line_raw(l).is_none()
+        }) {
+            album_title = (*fallback_line).to_string();
+        }
+    }
+
+    // Parsear pistas desde Tracklist (o desde el primer Disc 1 / pista numerada)
+    let track_scan_start = tracklist_line_idx.unwrap_or(0);
+    let mut tracks = Vec::new();
+    let mut current_disc = 1u32;
+
+    for &line in &lines[track_scan_start..] {
+        if line.is_empty() {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if !tracks.is_empty()
+            && matches!(
+                lower.as_str(),
+                "notes"
+                    | "album stats"
+                    | "related albums"
+                    | "available at"
+                    | "websites"
+                    | "covers"
+                    | "entry stats"
+                    | "products represented"
+                    | "discussion"
+                    | "user comments"
+            )
+        {
+            break;
+        }
+        if lower.starts_with("disc length") || lower.starts_with("total length") {
+            continue;
+        }
+        if matches!(
+            lower.as_str(),
+            "english" | "romaji" | "japanese" | "tracklist" | "english (official)"
+        ) {
+            continue;
+        }
+        if let Some(d) = parse_disc_header_number(line) {
+            current_disc = d;
+            continue;
+        }
+        if let Some(mut tr) = parse_copied_track_line(line, &composers) {
+            tr.disc_number = current_disc;
+            tracks.push(tr);
+        }
+    }
+
+    if album_title.is_empty() && !catalog.is_empty() {
+        album_title = catalog.clone();
+    }
+    if album_title.is_empty() && tracks.is_empty() {
+        bail!("El texto pegado no parece contener una ficha ni lista de pistas válida de VGMdb.");
+    }
+
+    Ok(AlbumMetadata {
+        source: "VGMdb (Texto)".to_string(),
+        album_title,
+        catalog,
+        release_date,
+        publisher,
+        composers,
+        arrangers,
+        performers,
+        lyricists,
+        tracks,
+    })
+}
+
+fn strip_discogs_disambiguation(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.ends_with(')') {
+        if let Some(open_idx) = trimmed.rfind(" (") {
+            let inner = &trimmed[open_idx + 2..trimmed.len() - 1];
+            if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()) {
+                return trimmed[..open_idx].trim().to_string();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+fn prefer_english_discogs_title(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some((left, right)) = trimmed.split_once(" = ") {
+        let r = right.trim();
+        if has_non_ascii(left) && !r.is_empty() && !has_non_ascii(r) {
+            return r.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn parse_discogs_position(pos: &str, current_disc: u32, fallback_track: u32) -> (u32, u32) {
+    let trimmed = pos.trim();
+    if trimmed.is_empty() {
+        return (current_disc, fallback_track);
+    }
+    if let Some((left, right)) = trimmed.split_once('-').or_else(|| trimmed.split_once('.')) {
+        let d_digits: String = left.chars().filter(|c| c.is_ascii_digit()).collect();
+        let t_digits: String = right.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let (Ok(d), Ok(t)) = (d_digits.parse::<u32>(), t_digits.parse::<u32>()) {
+            if d > 0 && t > 0 {
+                return (d, t);
+            }
+        }
+    }
+    let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
+    let track_num = digits
+        .parse::<u32>()
+        .ok()
+        .filter(|n| *n > 0)
+        .unwrap_or(fallback_track);
+    (current_disc, track_num)
+}
+
+fn collect_discogs_extraartists(
+    arr: Option<&Value>,
+    composers: &mut Vec<String>,
+    arrangers: &mut Vec<String>,
+    performers: &mut Vec<String>,
+    lyricists: &mut Vec<String>,
+    track_composers_only: Option<&mut Vec<String>>,
+) {
+    let Some(items) = arr.and_then(Value::as_array) else {
+        return;
+    };
+    let mut track_comp = track_composers_only;
+    for ea in items {
+        let Some(raw_name) = ea.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = strip_discogs_disambiguation(raw_name);
+        if name.is_empty() {
+            continue;
+        }
+        let role = ea
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        let is_composer = role.contains("composed")
+            || role.contains("composer")
+            || role.contains("music by")
+            || role.contains("written-by")
+            || role.contains("written by")
+            || role.contains("songwriter")
+            || role == "music";
+        let is_arranger = role.contains("arranged") || role.contains("orchestrated");
+        let is_lyricist = role.contains("lyrics") || role.contains("lyricist");
+        let is_performer = role.contains("vocal")
+            || role.contains("perform")
+            || role.contains("piano")
+            || role.contains("guitar")
+            || role.contains("violin")
+            || role.contains("drums")
+            || role.contains("bass")
+            || role.contains("synth")
+            || role.contains("chorus")
+            || role.contains("featuring");
+
+        if is_composer {
+            push_unique(composers, name.clone());
+            if let Some(ref mut tc) = track_comp {
+                push_unique(tc, name.clone());
+            }
+        }
+        if is_arranger {
+            push_unique(arrangers, name.clone());
+        }
+        if is_lyricist {
+            push_unique(lyricists, name.clone());
+        }
+        if is_performer {
+            push_unique(performers, name.clone());
+        }
+    }
+}
+
+pub(crate) fn parse_discogs_release_json(
+    detail: &Value,
+    requested_catalog: Option<&str>,
+    preserve_range: bool,
+) -> Result<AlbumMetadata> {
+    let raw_title = detail
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .context("La respuesta de Discogs no contiene título de lanzamiento")?;
+    let album_title = prefer_english_discogs_title(raw_title);
+
+    let release_date = detail
+        .get("released")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            detail
+                .get("year")
+                .and_then(Value::as_u64)
+                .filter(|y| *y > 0)
+                .map(|y| y.to_string())
+        })
+        .unwrap_or_default();
+
+    let mut publisher = String::new();
+    let mut label_catnos = Vec::new();
+    if let Some(labels) = detail.get("labels").and_then(Value::as_array) {
+        if let Some(first) = labels.first() {
+            if let Some(name) = first.get("name").and_then(Value::as_str) {
+                publisher = strip_discogs_disambiguation(name);
+            }
+        }
+        for lbl in labels {
+            if let Some(c) = lbl.get("catno").and_then(Value::as_str) {
+                let c_trim = c.trim();
+                if !c_trim.is_empty()
+                    && !c_trim.eq_ignore_ascii_case("none")
+                    && !label_catnos.iter().any(|x: &String| x == c_trim)
+                {
+                    label_catnos.push(c_trim.to_string());
+                }
+            }
+        }
+    }
+
+    let catalog = if preserve_range {
+        requested_catalog
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| label_catnos.join(" / "))
+    } else if !label_catnos.is_empty() {
+        label_catnos.join(" / ")
+    } else {
+        requested_catalog.unwrap_or("").trim().to_string()
+    };
+
+    let mut composers = Vec::new();
+    let mut arrangers = Vec::new();
+    let mut performers = Vec::new();
+    let mut lyricists = Vec::new();
+
+    collect_discogs_extraartists(
+        detail.get("extraartists"),
+        &mut composers,
+        &mut arrangers,
+        &mut performers,
+        &mut lyricists,
+        None,
+    );
+
+    if composers.is_empty() {
+        if let Some(artists) = detail.get("artists").and_then(Value::as_array) {
+            for art in artists {
+                if let Some(raw_name) = art.get("name").and_then(Value::as_str) {
+                    let clean = strip_discogs_disambiguation(raw_name);
+                    if !clean.is_empty()
+                        && !clean.eq_ignore_ascii_case("various")
+                        && !clean.eq_ignore_ascii_case("various artists")
+                    {
+                        push_unique(&mut composers, clean);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut tracks = Vec::new();
+    let mut current_disc = 1u32;
+    let mut track_counter = 1u32;
+
+    if let Some(tracklist) = detail.get("tracklist").and_then(Value::as_array) {
+        for tr in tracklist {
+            let tr_type = tr
+                .get("type_")
+                .and_then(Value::as_str)
+                .unwrap_or("track")
+                .trim();
+
+            if tr_type.eq_ignore_ascii_case("heading") {
+                if let Some(heading_title) = tr.get("title").and_then(Value::as_str) {
+                    if let Some(d) = parse_disc_header_number(heading_title) {
+                        current_disc = d;
+                        track_counter = 1;
+                    }
+                }
+                continue;
+            }
+
+            if tr_type.eq_ignore_ascii_case("index") {
+                continue;
+            }
+
+            let raw_pos = tr.get("position").and_then(Value::as_str).unwrap_or("");
+            let (disc_number, track_number) =
+                parse_discogs_position(raw_pos, current_disc, track_counter);
+            if disc_number != current_disc {
+                current_disc = disc_number;
+            }
+
+            let title = tr
+                .get("title")
+                .and_then(Value::as_str)
+                .map(prefer_english_discogs_title)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("Pista {}", track_number));
+
+            let duration = tr
+                .get("duration")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+
+            let mut track_composers = Vec::new();
+            collect_discogs_extraartists(
+                tr.get("extraartists"),
+                &mut composers,
+                &mut arrangers,
+                &mut performers,
+                &mut lyricists,
+                Some(&mut track_composers),
+            );
+
+            tracks.push(TrackInfo {
+                disc_number,
+                track_number,
+                title,
+                duration,
+                composers: track_composers,
+            });
+            track_counter = track_number + 1;
+        }
+    }
+
+    for tr in &mut tracks {
+        if tr.composers.is_empty() {
+            tr.composers = composers.clone();
+        }
+    }
+
+    Ok(AlbumMetadata {
+        source: "Discogs".to_string(),
+        album_title,
+        catalog,
+        release_date,
+        publisher,
+        composers,
+        arrangers,
+        performers,
+        lyricists,
+        tracks,
+    })
+}
+
+fn lookup_via_discogs_release_id(release_id: &str) -> Result<AlbumMetadata> {
+    let url = format!("{}/releases/{}", DISCOGS_BASE_URL, release_id.trim());
+    let detail = curl_get_json_retry(&url, 12, 3)?;
+    parse_discogs_release_json(&detail, None, false)
+}
+
+fn lookup_via_discogs(catalog_query: &str) -> Result<AlbumMetadata> {
+    let trimmed = catalog_query.trim();
+    let variants = expand_catalog_variants(trimmed);
+
+    let find_matching_release = |results: &[Value]| -> Option<u64> {
+        results.iter().find_map(|item| {
+            let catno = item.get("catno").and_then(Value::as_str)?;
+            if variants.matches(catno) {
+                item.get("id").and_then(Value::as_u64)
+            } else {
+                None
+            }
+        })
+    };
+
+    let search_url = format!(
+        "{}/database/search?catno={}&type=release",
+        DISCOGS_BASE_URL,
+        percent_encode(trimmed)
+    );
+    let search_json = curl_get_json_retry(&search_url, 12, 3)?;
+    let mut chosen_id = search_json
+        .get("results")
+        .and_then(Value::as_array)
+        .and_then(|arr| find_matching_release(arr));
+
+    if chosen_id.is_none() && variants.is_range {
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let base_url = format!(
+            "{}/database/search?catno={}&type=release",
+            DISCOGS_BASE_URL,
+            percent_encode(&variants.base_catalog)
+        );
+        if let Ok(base_json) = curl_get_json_retry(&base_url, 12, 2) {
+            chosen_id = base_json
+                .get("results")
+                .and_then(Value::as_array)
+                .and_then(|arr| find_matching_release(arr));
+        }
+    }
+
+    let release_id = chosen_id.with_context(|| {
+        format!(
+            "No se encontró el catálogo '{}' en Discogs",
+            trimmed
+        )
+    })?;
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let detail_url = format!("{}/releases/{}", DISCOGS_BASE_URL, release_id);
+    let detail = curl_get_json_retry(&detail_url, 12, 3)?;
+    parse_discogs_release_json(&detail, Some(trimmed), variants.is_range)
 }
 
 fn lookup_via_vgmdb_api(query: &str, base_url: &str) -> Result<AlbumMetadata> {
@@ -1112,9 +2461,10 @@ fn lookup_via_musicbrainz(catalog_query: &str) -> Result<AlbumMetadata> {
 pub(crate) fn lookup_album(query: &str, vgmdb_base_url: Option<&str>) -> Result<AlbumMetadata> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
-        bail!("Ingresá un código de catálogo (ej: SQEX-10001) o URL/ID de VGMdb.");
+        bail!("Ingresá un código de catálogo (ej: SQEX-10001), URL/ID de VGMdb o URL de Discogs.");
     }
 
+    // 1. Archivo local (.json, .html/.htm, .txt)
     let as_path = Path::new(trimmed);
     if as_path.is_file() {
         if let Some(ext) = as_path.extension().and_then(OsStr::to_str) {
@@ -1128,36 +2478,69 @@ pub(crate) fn lookup_album(query: &str, vgmdb_base_url: Option<&str>) -> Result<
                 let raw = fs::read_to_string(as_path)
                     .with_context(|| format!("No se pudo leer el archivo HTML {}", as_path.display()))?;
                 return parse_vgmdb_html(&raw, "");
+            } else if ext.eq_ignore_ascii_case("txt") {
+                let raw = fs::read_to_string(as_path)
+                    .with_context(|| format!("No se pudo leer el archivo de texto {}", as_path.display()))?;
+                return parse_vgmdb_copied_text(&raw);
             }
         }
     }
 
-    let base_url = vgmdb_base_url
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(DEFAULT_VGMDB_BASE_URL);
+    // 2. Contenido pegado directamente (HTML, JSON o texto copiado de VGMdb)
+    if looks_like_vgmdb_html(trimmed) {
+        return parse_vgmdb_html(trimmed, "");
+    }
+    if trimmed.starts_with('{') {
+        let val: Value = serde_json::from_str(trimmed.trim_start_matches('\u{feff}'))
+            .context("El texto JSON pegado no es válido")?;
+        return parse_vgmdb_album_json(&val, "");
+    }
+    if looks_like_vgmdb_copied_text(trimmed) {
+        return parse_vgmdb_copied_text(trimmed);
+    }
 
-    match lookup_via_vgmdb_api(trimmed, base_url) {
+    // 3. URL directa de Discogs (ej: https://www.discogs.com/release/1830265-...)
+    if let Some(discogs_id) = extract_discogs_release_id(trimmed) {
+        return lookup_via_discogs_release_id(&discogs_id);
+    }
+
+    // 4. Mirror explícito de API VGMdb (solo si el usuario pasó --vgmdb-url)
+    if let Some(custom_base) = vgmdb_base_url.map(str::trim).filter(|s| !s.is_empty()) {
+        match lookup_via_vgmdb_api(trimmed, custom_base) {
+            Ok(album) => return Ok(album),
+            Err(err) if extract_vgmdb_album_id(trimmed).is_some() => {
+                bail!("No se pudo consultar el servidor VGMdb '{}': {:#}", custom_base, err);
+            }
+            Err(_) => {}
+        }
+    }
+
+    // 5. URL o ID directo de VGMdb sin servidor mirror activo
+    if let Some(id) = extract_vgmdb_album_id(trimmed) {
+        bail!(
+            "VGMdb ID {} detected (https://vgmdb.net/album/{}). \
+             La API externa vgmdb.info está caída de forma permanente y vgmdb.net requiere un navegador real (Cloudflare).\n\
+             Abrí https://vgmdb.net/album/{} en tu navegador, presioná Ctrl+A y Ctrl+C, y luego tocá '📋 Pegar VGMdb' en la app.",
+            id,
+            id,
+            id
+        );
+    }
+
+    // 6. Búsqueda por código de catálogo en APIs abiertas y activas: MusicBrainz -> Discogs
+    match lookup_via_musicbrainz(trimmed) {
         Ok(album) => Ok(album),
-        Err(vgmdb_err) => {
-            if let Some(id) = extract_vgmdb_album_id(trimmed) {
+        Err(mb_err) => match lookup_via_discogs(trimmed) {
+            Ok(album) => Ok(album),
+            Err(dg_err) => {
                 bail!(
-                    "No se pudo consultar VGMdb para la URL/ID '{}' (ID: {}) ({:#}). \
-                     Si la API de vgmdb.info está temporalmente fuera de servicio, podés guardar la página en tu navegador (Ctrl+S) y cargarla con el botón '📂 Cargar JSON / HTML'.",
+                    "No se encontró '{}' ni en MusicBrainz ({:#}) ni en Discogs ({:#}).",
                     trimmed,
-                    id,
-                    vgmdb_err
+                    mb_err,
+                    dg_err
                 );
             }
-            lookup_via_musicbrainz(trimmed).map_err(|mb_err| {
-                anyhow::anyhow!(
-                    "No se encontró '{}' ni en VGMdb ({:#}) ni en MusicBrainz ({:#}).",
-                    trimmed,
-                    vgmdb_err,
-                    mb_err
-                )
-            })
-        }
+        },
     }
 }
 
@@ -1635,5 +3018,222 @@ mod tests {
         assert_eq!(meta.tracks[2].disc_number, 2);
         assert_eq!(meta.tracks[2].track_number, 1);
         assert_eq!(meta.tracks[2].title, "Drama Chapter 1");
+    }
+
+    #[test]
+    fn test_parse_vgmdb_html_real_structure() {
+        let real_like_html = r##"
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>NECA-30048~9 | ZWEI!! Original Sound Track - VGMdb</title>
+            <script type="text/javascript">
+                var hidden = '<span class="albumtitle">Fake Title</span>';
+            </script>
+        </head>
+        <body>
+            <h1><span class="albumtitle" lang="en" style="display:inline">ZWEI!! Original Sound Track</span><span class="albumtitle" lang="ja" style="display:none"><em> / </em>ツヴァイ!! オリジナル・サウンドトラック</span><span class="albumtitle" lang="ja-Latn" style="display:none"><em> / </em>ZWEI!! Original Sound Track</span></h1>
+            <table id="album_infobit_large" cellpadding="1" cellspacing="1">
+                <tr><td nowrap="nowrap"><span class="label"><b>Catalog Number</b></span></td>
+                <td width="100%"><span id="childbrowse"><a href="#">NECA-30048~9</a><script type="text/javascript">vBmenu.register('childbrowse');</script></span>
+                <div class="vbmenu_popup" id="childbrowse_menu" style="display:none"><table><tr><td>NECA-30048 (Disc 1)</td></tr></table></div>
+                </td></tr>
+                <tr><td nowrap="nowrap"><span class="label"><b>Release Date</b></span></td>
+                <td><a href="/db/calendar.php?year=2001&month=12#20011221">Dec 21, 2001</a></td></tr>
+                <tr class="maincred"><td nowrap="nowrap"><span class="label"><b>Publisher</b></span></td><td><a href="/org/55"><span class="productname" lang="en" style="display:inline">Nihon Falcom Corporation</span><span style="display:none"><em> / </em></span><span class="productname" lang="ja" style="display:none">日本ファルコム株式会社</span></a></td></tr>
+                <tr class="maincred"><td nowrap="nowrap"><span class="label"><b><span title="Composer" class="artistname" lang="en" style="display:inline">Composer</span><span style="display:none"><em> / </em></span><span title="Composer" class="artistname" lang="ja" style="display:none">Composer</span></b></span></td><td width="100%"><a href="/artist/293"><span title="ファルコム" class="artistname" lang="en" style="display:inline">Falcom Sound Team jdk</span><span style="display:none"><em> / </em></span><span class="artistname" lang="ja" style="display:none">ファルコム・サウンド・チーム・jdk</span></a> (<a href="/artist/703"><span class="artistname" lang="en" style="display:inline">Atsushi Shirakawa</span><span class="artistname" lang="ja" style="display:none">白川篤史</span></a>, <a href="/artist/2151"><span class="artistname" lang="en" style="display:inline">Hayato Sonoda</span></a>)</td></tr>
+            </table>
+            <div>
+                <h3>Tracklist</h3>
+                <ul id="tlnav" class="tabnav"><li><a class='smallfont' rel='tl12381' href='#'>Japanese</a></li><li class="active"><a class='smallfont' rel='tl1033' href='#'>English</a></li></ul>
+            </div>
+            <div style="padding: 6px 10px 10px 10px" id="tracklist">
+                <span class="tl" id="tl12381" style="display: none">
+                    <span style="font-size:8pt"><b>Disc 1</b></span>
+                    <table cellpadding="1" cellspacing="0" border="0" class="role">
+                        <tr class="rolebit"><td><span class="label">01</span></td><td>日本語タイトル</td><td><span class="time">2:00</span></td></tr>
+                    </table>
+                </span>
+                <span class="tl" id="tl1033">
+                    <span style="font-size:8pt"><b>Disc 1</b></span>
+                    <table cellpadding="1" cellspacing="0" border="0" class="role">
+                        <tr class="rolebit">
+                            <td class="smallfont"><span class="label">01</span></td>
+                            <td class="smallfont" width="100%" colspan="2">Prelude - To the Ancient World</td>
+                            <td class="smallfont" align="right"><span class="time">2:00</span></td>
+                        </tr>
+                        <tr class="rolebit">
+                            <td class="smallfont"><span class="label">02</span></td>
+                            <td class="smallfont" width="100%" colspan="2">Puck Village</td>
+                            <td class="smallfont" align="right"><span class="time">3:15</span></td>
+                        </tr>
+                    </table>
+                    <span style="float: right;">
+                        <span class="smallfont">Disc length</span>
+                        <span class="time">53:21</span>
+                    </span>
+                    <span style="font-size:8pt"><b>Disc 2</b></span>
+                    <table cellpadding="1" cellspacing="0" border="0" class="role">
+                        <tr class="rolebit">
+                            <td class="smallfont"><span class="label">01</span></td>
+                            <td class="smallfont" width="100%" colspan="2">Ending Theme</td>
+                            <td class="smallfont" align="right"><span class="time">4:10</span></td>
+                        </tr>
+                    </table>
+                </span>
+            </div>
+            <h3>Notes</h3>
+        </body>
+        </html>
+        "##;
+
+        let meta = parse_vgmdb_html(real_like_html, "").expect("Debe parsear HTML real de VGMdb");
+        assert_eq!(meta.album_title, "ZWEI!! Original Sound Track");
+        assert_eq!(meta.catalog, "NECA-30048~9");
+        assert_eq!(meta.release_date, "Dec 21, 2001");
+        assert_eq!(meta.publisher, "Nihon Falcom Corporation");
+        assert_eq!(
+            meta.composers,
+            vec!["Falcom Sound Team jdk (Atsushi Shirakawa, Hayato Sonoda)"]
+        );
+        assert_eq!(meta.tracks.len(), 3);
+        assert_eq!(meta.tracks[0].disc_number, 1);
+        assert_eq!(meta.tracks[0].track_number, 1);
+        assert_eq!(meta.tracks[0].title, "Prelude - To the Ancient World");
+        assert_eq!(meta.tracks[0].duration, "2:00");
+        assert_eq!(meta.tracks[1].disc_number, 1);
+        assert_eq!(meta.tracks[1].track_number, 2);
+        assert_eq!(meta.tracks[1].title, "Puck Village");
+        assert_eq!(meta.tracks[2].disc_number, 2);
+        assert_eq!(meta.tracks[2].track_number, 1);
+        assert_eq!(meta.tracks[2].title, "Ending Theme");
+        assert_eq!(meta.tracks[2].duration, "4:10");
+    }
+
+    #[test]
+    fn test_parse_vgmdb_copied_text_full_page() {
+        let copied = "\
+VGMdb
+Albums
+Artists
+Labels
+Search
+Login
+Zill O'll -infinite- ORIGINAL SOUND TRACK & DRAMA
+ジルオール インフィニット オリジナル・サウンドトラック＆ドラマ
+Catalog Number\tKECH-1346~7
+Release Date\tOct 26, 2005
+Publish Format\tCommercial
+Media Format\t2 CD
+Classification\tOriginal Soundtrack, Drama
+Published by\tKOEI Co., Ltd.
+Composed by\tHiromi Mizutani, Koei BGM Division
+
+Credits
+Composed by\tHiromi Mizutani, Koei BGM Division
+
+Tracklist
+English
+Disc 1 [KECH-1346]
+01\tOpening\t2:14
+02\tAwakening\t1:45
+Disc length\t45:12
+Disc 2 [KECH-1347]
+01\tSecrecy\t1:55
+02\tEnding\t4:32
+Disc length\t48:10
+
+Notes
+All tracks composed by Koei BGM Division.
+Album Stats
+";
+        assert!(looks_like_vgmdb_copied_text(copied));
+        let meta = parse_vgmdb_copied_text(copied).expect("Debe parsear texto copiado de VGMdb");
+        assert_eq!(meta.source, "VGMdb (Texto)");
+        assert_eq!(meta.album_title, "Zill O'll -infinite- ORIGINAL SOUND TRACK & DRAMA");
+        assert_eq!(meta.catalog, "KECH-1346~7");
+        assert_eq!(meta.release_date, "Oct 26, 2005");
+        assert_eq!(meta.publisher, "KOEI Co., Ltd.");
+        assert_eq!(meta.composers, vec!["Hiromi Mizutani", "Koei BGM Division"]);
+        assert_eq!(meta.tracks.len(), 4);
+        assert_eq!(meta.tracks[0].disc_number, 1);
+        assert_eq!(meta.tracks[0].track_number, 1);
+        assert_eq!(meta.tracks[0].title, "Opening");
+        assert_eq!(meta.tracks[0].duration, "2:14");
+        assert_eq!(meta.tracks[2].disc_number, 2);
+        assert_eq!(meta.tracks[2].track_number, 1);
+        assert_eq!(meta.tracks[2].title, "Secrecy");
+        assert_eq!(meta.tracks[3].track_number, 2);
+        assert_eq!(meta.tracks[3].title, "Ending");
+        assert_eq!(meta.tracks[3].duration, "4:32");
+    }
+
+    #[test]
+    fn test_extract_discogs_release_id_and_parse_json() {
+        assert_eq!(
+            extract_discogs_release_id("https://www.discogs.com/release/1830265-Nobuo-Uematsu-Final-Fantasy-VII"),
+            Some("1830265".to_string())
+        );
+        assert_eq!(
+            extract_discogs_release_id("https://api.discogs.com/releases/753387"),
+            None
+        );
+        assert_eq!(
+            extract_discogs_release_id("https://discogs.com/release/753387"),
+            Some("753387".to_string())
+        );
+        assert_eq!(extract_vgmdb_album_id("https://www.discogs.com/release/1830265"), None);
+
+        let sample_discogs = serde_json::json!({
+            "id": 753387,
+            "title": "トバル ナンバーワン = Tobal No.1 (Original Sound Track)",
+            "released": "1996-08-21",
+            "labels": [
+                {"name": "DigiCube (2)", "catno": "SSCX-10001"}
+            ],
+            "extraartists": [
+                {"name": "Yasunori Mitsuda (2)", "role": "Composed By, Arranged By"},
+                {"name": "Kenji Ito", "role": "Composed By"},
+                {"name": "Haruki Nakayama", "role": "Vocals"}
+            ],
+            "tracklist": [
+                {"position": "", "type_": "heading", "title": "Disc 1"},
+                {"position": "1-1", "type_": "track", "title": "Tobal No.1", "duration": "1:09"},
+                {"position": "2-1", "type_": "track", "title": "Finale", "duration": "3:11"}
+            ]
+        });
+
+        let meta = parse_discogs_release_json(&sample_discogs, Some("SSCX-10001~2"), true)
+            .expect("Debe parsear JSON de Discogs");
+        assert_eq!(meta.source, "Discogs");
+        assert_eq!(meta.album_title, "Tobal No.1 (Original Sound Track)");
+        assert_eq!(meta.catalog, "SSCX-10001~2");
+        assert_eq!(meta.release_date, "1996-08-21");
+        assert_eq!(meta.publisher, "DigiCube");
+        assert_eq!(meta.composers, vec!["Yasunori Mitsuda", "Kenji Ito"]);
+        assert_eq!(meta.arrangers, vec!["Yasunori Mitsuda"]);
+        assert_eq!(meta.performers, vec!["Haruki Nakayama"]);
+        assert_eq!(meta.tracks.len(), 2);
+        assert_eq!(meta.tracks[0].disc_number, 1);
+        assert_eq!(meta.tracks[0].track_number, 1);
+        assert_eq!(meta.tracks[1].disc_number, 2);
+        assert_eq!(meta.tracks[1].track_number, 1);
+    }
+
+    #[test]
+    fn test_build_vgmdb_browser_url() {
+        assert_eq!(
+            build_vgmdb_browser_url("https://vgmdb.net/album/10200"),
+            "https://vgmdb.net/album/10200"
+        );
+        assert_eq!(
+            build_vgmdb_browser_url("10200"),
+            "https://vgmdb.net/album/10200"
+        );
+        assert_eq!(
+            build_vgmdb_browser_url("KECH-1346~7"),
+            "https://vgmdb.net/search?q=KECH-1346%7E7"
+        );
+        assert_eq!(build_vgmdb_browser_url(""), "https://vgmdb.net/");
     }
 }

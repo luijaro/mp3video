@@ -65,7 +65,11 @@ use crate::cue::{
     parse_tracks_from_review, resolve_cue_for_input, split_cue_to_mp3,
     try_extract_chapters_as_cue, try_extract_embedded_cuesheet, CueSheet, CueTrack,
 };
-use crate::vgmdb::{lookup_album, AlbumMetadata};
+use crate::vgmdb::{
+    build_vgmdb_browser_url, extract_vgmdb_album_id, lookup_album, looks_like_vgmdb_copied_text,
+    looks_like_vgmdb_html, parse_vgmdb_album_json, parse_vgmdb_copied_text, parse_vgmdb_html,
+    AlbumMetadata,
+};
 use crate::youtube::{
     authorize_interactive, default_token_store_path, has_saved_tokens, upload_videos_batch,
     PrivacyStatus,
@@ -105,6 +109,7 @@ const ID_BTN_COPY_TIMESTAMPS: usize = 114;
 const ID_CHK_FULL_ALBUM: usize = 115;
 const ID_BTN_VGMDB_JSON: usize = 116;
 const ID_BTN_VGMDB_PASTE: usize = 117;
+const ID_BTN_VGMDB_OPEN: usize = 118;
 
 const RESOLUTIONS: &[(&str, (u32, u32))] = &[
     ("1920x1080 (Full HD 16:9)", (1920, 1080)),
@@ -256,6 +261,7 @@ struct GuiState {
     edit_vgmdb_code: HWND,
     btn_vgmdb_paste: HWND,
     btn_vgmdb_search: HWND,
+    btn_vgmdb_open: HWND,
     btn_vgmdb_json: HWND,
     lbl_vgmdb_info: HWND,
     edit_album: HWND,
@@ -315,6 +321,7 @@ impl GuiState {
             edit_vgmdb_code: null_mut(),
             btn_vgmdb_paste: null_mut(),
             btn_vgmdb_search: null_mut(),
+            btn_vgmdb_open: null_mut(),
             btn_vgmdb_json: null_mut(),
             lbl_vgmdb_info: null_mut(),
             edit_album: null_mut(),
@@ -353,7 +360,7 @@ impl GuiState {
         (logical_px * self.dpi + 48) / 96
     }
 
-    fn editable_controls(&self) -> [HWND; 35] {
+    fn editable_controls(&self) -> [HWND; 36] {
         [
             self.edit_input,
             self.btn_browse_input_dir,
@@ -374,6 +381,7 @@ impl GuiState {
             self.edit_vgmdb_code,
             self.btn_vgmdb_paste,
             self.btn_vgmdb_search,
+            self.btn_vgmdb_open,
             self.btn_vgmdb_json,
             self.edit_album,
             self.edit_composers,
@@ -1384,11 +1392,11 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
     );
     set_checked(state.chk_overwrite, saved.overwrite);
 
-    // Grupo VGMdb / MusicBrainz
+    // Grupo MusicBrainz / Discogs / VGMdb
     create_child(
         hwnd,
         "BUTTON",
-        "Metadatos del Álbum (VGMdb / MusicBrainz)",
+        "Metadatos del Álbum (MusicBrainz / Discogs / VGMdb)",
         BS_GROUPBOX as u32 | WS_GROUP,
         0,
         state.px(16),
@@ -1407,7 +1415,7 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         0,
         state.px(28),
         state.px(261),
-        state.px(90),
+        state.px(88),
         state.px(18),
         0,
         f_reg,
@@ -1425,41 +1433,54 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
         0,
         f_reg,
     );
-    state.btn_vgmdb_paste = create_child(
-        hwnd,
-        "BUTTON",
-        "📋 Pegar URL",
-        BS_PUSHBUTTON as u32 | WS_TABSTOP,
-        0,
-        state.px(295),
-        state.px(258),
-        state.px(95),
-        state.px(23),
-        ID_BTN_VGMDB_PASTE,
-        f_reg,
-    );
     state.btn_vgmdb_search = create_child(
         hwnd,
         "BUTTON",
         "🔍 Buscar",
         BS_PUSHBUTTON as u32 | WS_TABSTOP,
         0,
-        state.px(394),
+        state.px(294),
         state.px(258),
-        state.px(80),
+        state.px(74),
         state.px(23),
         ID_BTN_VGMDB_SEARCH,
+        f_reg,
+    );
+    state.btn_vgmdb_open = create_child(
+        hwnd,
+        "BUTTON",
+        "🌐 Abrir VGMdb",
+        BS_PUSHBUTTON as u32 | WS_TABSTOP,
+        0,
+        state.px(372),
+        state.px(258),
+        state.px(106),
+        state.px(23),
+        ID_BTN_VGMDB_OPEN,
+        f_reg,
+    );
+    state.btn_vgmdb_paste = create_child(
+        hwnd,
+        "BUTTON",
+        "📋 Pegar VGMdb",
+        BS_PUSHBUTTON as u32 | WS_TABSTOP,
+        0,
+        state.px(482),
+        state.px(258),
+        state.px(112),
+        state.px(23),
+        ID_BTN_VGMDB_PASTE,
         f_reg,
     );
     state.btn_vgmdb_json = create_child(
         hwnd,
         "BUTTON",
-        "📂 Cargar JSON / HTML",
+        "📂 Archivo",
         BS_PUSHBUTTON as u32 | WS_TABSTOP,
         0,
-        state.px(478),
+        state.px(598),
         state.px(258),
-        state.px(148),
+        state.px(82),
         state.px(23),
         ID_BTN_VGMDB_JSON,
         f_reg,
@@ -1467,12 +1488,12 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
     state.lbl_vgmdb_info = create_child(
         hwnd,
         "STATIC",
-        "Sin disco cargado (ej: SQEX-10001, KECH-1346~7 o https://vgmdb.net/album/10200)",
+        "Sin disco cargado",
         0,
         0,
-        state.px(632),
+        state.px(686),
         state.px(261),
-        state.px(242),
+        state.px(188),
         state.px(16),
         0,
         f_small,
@@ -2185,6 +2206,97 @@ fn active_cue_with_reviewed_tracks(
     Ok(Some((cue, reviewed)))
 }
 
+fn open_url_in_browser(hwnd: HWND, url: &str) {
+    let target_w = to_wide(url);
+    let open_w = to_wide("open");
+    unsafe {
+        ShellExecuteW(
+            hwnd,
+            open_w.as_ptr(),
+            target_w.as_ptr(),
+            null(),
+            null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+fn apply_loaded_album_to_ui(state: &mut GuiState, album: AlbumMetadata) {
+    let comp_str = album.composers.join(", ");
+    set_window_text(state.edit_album, &album.album_title);
+    set_window_text(state.edit_composers, &comp_str);
+    set_window_text(
+        state.lbl_vgmdb_info,
+        &format!("[{}] {} pistas cargadas", album.source, album.tracks.len()),
+    );
+
+    if !album.catalog.is_empty() {
+        let current_code = get_window_text(state.edit_vgmdb_code).trim().to_string();
+        let lower_code = current_code.to_ascii_lowercase();
+        if current_code.is_empty()
+            || lower_code.starts_with("http")
+            || lower_code.starts_with("vgmdb.")
+            || Path::new(&current_code).is_file()
+        {
+            set_window_text(state.edit_vgmdb_code, &album.catalog);
+        }
+    }
+
+    // Si hay un CUE cargado, actualizar títulos de pistas con los del álbum encontrado
+    if let Some(ref mut cue) = state.cue_sheet {
+        for (idx, cue_tr) in cue.tracks.iter_mut().enumerate() {
+            let found = album
+                .tracks
+                .iter()
+                .find(|t| t.track_number == cue_tr.track_number)
+                .or_else(|| album.tracks.get(idx));
+            if let Some(m) = found {
+                cue_tr.title = m.title.clone();
+            }
+        }
+        set_window_text(state.edit_cue_tracks, &format_tracks_for_review(&cue.tracks));
+    }
+
+    append_log(
+        state.edit_log,
+        &format!(
+            "[{}] Album: '{}' | Catalog: {} | Composer(s): {} | {} tracks",
+            album.source,
+            album.album_title,
+            if album.catalog.is_empty() {
+                "N/A"
+            } else {
+                &album.catalog
+            },
+            if comp_str.is_empty() { "N/A" } else { &comp_str },
+            album.tracks.len()
+        ),
+    );
+    state.album_meta = Some(album);
+    save_settings(state);
+}
+
+fn prompt_open_vgmdb_in_browser(hwnd: HWND, state: &mut GuiState, query: &str, prompt_text: &str) {
+    let ans = show_msg_box(
+        hwnd,
+        "Abrir VGMdb en el navegador",
+        prompt_text,
+        MB_YESNO | MB_ICONQUESTION,
+    );
+    if ans == IDYES {
+        let url = build_vgmdb_browser_url(query);
+        open_url_in_browser(hwnd, &url);
+        set_window_text(state.lbl_vgmdb_info, "Copiá la página (Ctrl+A, Ctrl+C) y pegá");
+        append_log(
+            state.edit_log,
+            &format!(
+                "[VGMDB] Abriendo {} — Cuando cargue el disco, presioná Ctrl+A, Ctrl+C y luego '📋 Pegar VGMdb'.",
+                url
+            ),
+        );
+    }
+}
+
 fn start_vgmdb_search(hwnd: HWND, state: &mut GuiState) {
     if state.is_running || state.is_searching {
         return;
@@ -2193,9 +2305,27 @@ fn start_vgmdb_search(hwnd: HWND, state: &mut GuiState) {
     if code.is_empty() {
         show_msg_box(
             hwnd,
-            "Buscar en VGMdb",
-            "Ingresá un código de catálogo (ej: SQEX-10001), una URL de VGMdb (ej: https://vgmdb.net/album/10200) o presioná '📋 Pegar URL'.",
+            "Buscar álbum",
+            "Ingresá un código de catálogo (ej: SQEX-10001 o KECH-1346~7), URL de Discogs, o abrí VGMdb con '🌐 Abrir VGMdb' para copiar la ficha (Ctrl+A, Ctrl+C) y usar '📋 Pegar VGMdb'.",
             MB_OK | MB_ICONWARNING,
+        );
+        return;
+    }
+
+    // Si es una URL o ID directo de VGMdb (y no un archivo local), abrir en navegador directamente
+    if !Path::new(&code).is_file() && extract_vgmdb_album_id(&code).is_some() {
+        let url = build_vgmdb_browser_url(&code);
+        prompt_open_vgmdb_in_browser(
+            hwnd,
+            state,
+            &code,
+            &format!(
+                "Se detectó una URL/ID de VGMdb ({}).\n\
+                 La API pública vgmdb.info está caída y vgmdb.net requiere un navegador real.\n\n\
+                 ¿Querés abrir esa página en tu navegador ahora?\n\
+                 Cuando cargue, presioná Ctrl+A, Ctrl+C y luego tocá '📋 Pegar VGMdb'.",
+                url
+            ),
         );
         return;
     }
@@ -2204,10 +2334,11 @@ fn start_vgmdb_search(hwnd: HWND, state: &mut GuiState) {
     state.is_searching = true;
     unsafe {
         EnableWindow(state.btn_vgmdb_search, 0);
+        EnableWindow(state.btn_vgmdb_open, 0);
         EnableWindow(state.btn_vgmdb_paste, 0);
         EnableWindow(state.btn_vgmdb_json, 0);
     }
-    set_window_text(state.lbl_vgmdb_info, "Consultando VGMdb / MusicBrainz...");
+    set_window_text(state.lbl_vgmdb_info, "Consultando MusicBrainz / Discogs...");
     append_log(state.edit_log, &format!("Buscando álbum '{}'...", code));
 
     let hwnd_val = hwnd as usize;
@@ -3508,9 +3639,11 @@ fn handle_drop_files(hwnd: HWND, state: &mut GuiState, hdrop: HDROP) {
             set_window_text(state.edit_image, &dropped);
             append_log(state.edit_log, &format!("Imagen seleccionada: {}", dropped));
             save_settings(state);
-        } else if path.is_file() && has_extension(&path, &["json", "html", "htm"]) {
+        } else if path.is_file() && has_extension(&path, &["json", "html", "htm", "txt"]) {
             let content = fs::read_to_string(&path).unwrap_or_default();
-            if content.contains("\"installed\"") || content.contains("\"web\"") {
+            if has_extension(&path, &["json"])
+                && (content.contains("\"installed\"") || content.contains("\"web\""))
+            {
                 set_window_text(state.edit_client_secret, &dropped);
                 append_log(
                     state.edit_log,
@@ -3525,7 +3658,7 @@ fn handle_drop_files(hwnd: HWND, state: &mut GuiState, hdrop: HDROP) {
             show_msg_box(
                 hwnd,
                 "Archivo no compatible",
-                "Soltá una carpeta, .mp3, .cue, .flac, imagen o archivo .json / .html de VGMdb.",
+                "Soltá una carpeta, .mp3, .cue, .flac, imagen o archivo .json / .html / .txt de VGMdb.",
                 MB_OK | MB_ICONWARNING,
             );
         }
@@ -3617,23 +3750,94 @@ fn handle_command(hwnd: HWND, state: &mut GuiState, cmd_id: usize) {
             }
         }
         ID_BTN_VGMDB_SEARCH => start_vgmdb_search(hwnd, state),
+        ID_BTN_VGMDB_OPEN => {
+            let code = get_window_text(state.edit_vgmdb_code).trim().to_string();
+            let url = build_vgmdb_browser_url(&code);
+            open_url_in_browser(hwnd, &url);
+            set_window_text(state.lbl_vgmdb_info, "Copiá la página (Ctrl+A, Ctrl+C) y pegá");
+            append_log(
+                state.edit_log,
+                &format!(
+                    "[VGMDB] Abriendo en el navegador: {} — Cuando cargue el disco, presioná Ctrl+A, Ctrl+C y luego '📋 Pegar VGMdb'.",
+                    url
+                ),
+            );
+        }
         ID_BTN_VGMDB_PASTE => {
-            if let Some(text) = read_text_from_clipboard(hwnd) {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
+            if let Some(raw_clip) = read_text_from_clipboard(hwnd) {
+                let trimmed = raw_clip.trim();
+                if trimmed.is_empty() {
+                    show_msg_box(
+                        hwnd,
+                        "Portapapeles vacío",
+                        "El portapapeles no tiene texto.\nEntrá a la página del álbum en VGMdb, presioná Ctrl+A y Ctrl+C, y luego tocá '📋 Pegar VGMdb'.",
+                        MB_OK | MB_ICONINFORMATION,
+                    );
+                    return;
+                }
+
+                if looks_like_vgmdb_html(trimmed) {
+                    match parse_vgmdb_html(trimmed, "") {
+                        Ok(album) => apply_loaded_album_to_ui(state, album),
+                        Err(err) => {
+                            let msg = format!("No se pudo leer el HTML del portapapeles: {:#}", err);
+                            append_log(state.edit_log, &format!("[VGMDB PASTE ERROR] {}", msg));
+                            show_msg_box(hwnd, "Error al pegar HTML", &msg, MB_OK | MB_ICONWARNING);
+                        }
+                    }
+                } else if trimmed.starts_with('{') {
+                    match serde_json::from_str::<serde_json::Value>(trimmed.trim_start_matches('\u{feff}'))
+                        .map_err(anyhow::Error::from)
+                        .and_then(|val| parse_vgmdb_album_json(&val, ""))
+                    {
+                        Ok(album) => apply_loaded_album_to_ui(state, album),
+                        Err(err) => {
+                            let msg = format!("No se pudo leer el JSON del portapapeles: {:#}", err);
+                            append_log(state.edit_log, &format!("[VGMDB PASTE ERROR] {}", msg));
+                            show_msg_box(hwnd, "Error al pegar JSON", &msg, MB_OK | MB_ICONWARNING);
+                        }
+                    }
+                } else if looks_like_vgmdb_copied_text(trimmed) {
+                    match parse_vgmdb_copied_text(trimmed) {
+                        Ok(album) => apply_loaded_album_to_ui(state, album),
+                        Err(err) => {
+                            let msg = format!("No se pudo interpretar el texto de VGMdb: {:#}", err);
+                            append_log(state.edit_log, &format!("[VGMDB PASTE ERROR] {}", msg));
+                            show_msg_box(hwnd, "Error al pegar de VGMdb", &msg, MB_OK | MB_ICONWARNING);
+                        }
+                    }
+                } else if extract_vgmdb_album_id(trimmed).is_some() {
+                    set_window_text(state.edit_vgmdb_code, trimmed);
+                    save_settings(state);
+                    prompt_open_vgmdb_in_browser(
+                        hwnd,
+                        state,
+                        trimmed,
+                        "Se detectó una URL de VGMdb.\n\
+                         Como la API externa vgmdb.info está caída y vgmdb.net requiere un navegador real, ¿querés abrir la página en tu navegador ahora?\n\n\
+                         Cuando cargue, presioná Ctrl+A, Ctrl+C y volvé a hacer clic en '📋 Pegar VGMdb'.",
+                    );
+                } else if !trimmed.contains('\n') {
                     set_window_text(state.edit_vgmdb_code, trimmed);
                     save_settings(state);
                     append_log(
                         state.edit_log,
-                        &format!("URL / código pegado del portapapeles: {}", trimmed),
+                        &format!("URL / catálogo pegado del portapapeles: {}", trimmed),
                     );
                     start_vgmdb_search(hwnd, state);
+                } else {
+                    show_msg_box(
+                        hwnd,
+                        "Texto no reconocido",
+                        "El texto del portapapeles no parece una página de VGMdb ni un código de catálogo.\nEn VGMdb presioná Ctrl+A y Ctrl+C para copiar la página completa del álbum y luego tocá '📋 Pegar VGMdb'.",
+                        MB_OK | MB_ICONWARNING,
+                    );
                 }
             } else {
                 show_msg_box(
                     hwnd,
                     "Portapapeles sin texto",
-                    "No se encontró texto en el portapapeles.\nCopiá una URL de VGMdb (ej: https://vgmdb.net/album/10200) o código de catálogo y volvé a presionar este botón.",
+                    "No se encontró texto en el portapapeles.\nEn VGMdb presioná Ctrl+A y Ctrl+C, o copiá un código de catálogo / URL de Discogs y tocá '📋 Pegar VGMdb'.",
                     MB_OK | MB_ICONINFORMATION,
                 );
             }
@@ -3642,14 +3846,15 @@ fn handle_command(hwnd: HWND, state: &mut GuiState, cmd_id: usize) {
             let current = get_window_text(state.edit_vgmdb_code);
             if let Some(file) = pick_file(
                 hwnd,
-                "Elegí un archivo JSON o página HTML guardada de VGMdb",
+                "Elegí un archivo de VGMdb (.json, .html o .txt)",
                 &[
                     (
-                        "Archivos VGMdb (*.json; *.html; *.htm)",
-                        "*.json;*.html;*.htm",
+                        "Archivos VGMdb (*.json; *.html; *.htm; *.txt)",
+                        "*.json;*.html;*.htm;*.txt",
                     ),
                     ("Archivos JSON (*.json)", "*.json"),
                     ("Páginas HTML guardadas (*.html; *.htm)", "*.html;*.htm"),
+                    ("Texto copiado de VGMdb (*.txt)", "*.txt"),
                     ("Todos los archivos (*.*)", "*.*"),
                 ],
                 &current,
@@ -3893,6 +4098,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             if !state.is_running {
                 unsafe {
                     EnableWindow(state.btn_vgmdb_search, 1);
+                    EnableWindow(state.btn_vgmdb_open, 1);
                     EnableWindow(state.btn_vgmdb_paste, 1);
                     EnableWindow(state.btn_vgmdb_json, 1);
                 }
@@ -3900,58 +4106,17 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             if lparam != 0 {
                 let res = Box::from_raw(lparam as *mut std::result::Result<AlbumMetadata, String>);
                 match *res {
-                    Ok(album) => {
-                        let comp_str = album.composers.join(", ");
-                        set_window_text(state.edit_album, &album.album_title);
-                        set_window_text(state.edit_composers, &comp_str);
-                        set_window_text(
-                            state.lbl_vgmdb_info,
-                            &format!("[{}] {} pistas cargadas", album.source, album.tracks.len()),
-                        );
-
-                        // Si hay un CUE cargado, actualizar títulos de pistas con los del álbum encontrado
-                        if let Some(ref mut cue) = state.cue_sheet {
-                            for (idx, cue_tr) in cue.tracks.iter_mut().enumerate() {
-                                let found = album
-                                    .tracks
-                                    .iter()
-                                    .find(|t| t.track_number == cue_tr.track_number)
-                                    .or_else(|| album.tracks.get(idx));
-                                if let Some(m) = found {
-                                    cue_tr.title = m.title.clone();
-                                }
-                            }
-                            set_window_text(
-                                state.edit_cue_tracks,
-                                &format_tracks_for_review(&cue.tracks),
-                            );
-                        }
-
-                        append_log(
-                            state.edit_log,
-                            &format!(
-                                "[{}] Album: '{}' | Composer(s): {} | {} tracks",
-                                album.source,
-                                album.album_title,
-                                if comp_str.is_empty() {
-                                    "N/A"
-                                } else {
-                                    &comp_str
-                                },
-                                album.tracks.len()
-                            ),
-                        );
-                        state.album_meta = Some(album);
-                        save_settings(state);
-                    }
+                    Ok(album) => apply_loaded_album_to_ui(state, album),
                     Err(err_msg) => {
                         set_window_text(state.lbl_vgmdb_info, "No se encontró el disco.");
                         append_log(state.edit_log, &format!("[BUSQUEDA ERROR] {}", err_msg));
+                        let current_code = get_window_text(state.edit_vgmdb_code).trim().to_string();
                         let friendly = format!(
-                            "{}\n\nNota: Podés cargar los datos directamente desde un archivo con el botón '📂 Cargar JSON' o completar los campos manualmente.",
+                            "{}\n\n¿Querés abrir VGMdb en tu navegador para buscarlo?\n\
+                             Una vez en la página del disco, presioná Ctrl+A, Ctrl+C y hacé clic en '📋 Pegar VGMdb' para importar todos los datos automáticamente.",
                             err_msg
                         );
-                        show_msg_box(hwnd, "Búsqueda de disco", &friendly, MB_OK | MB_ICONWARNING);
+                        prompt_open_vgmdb_in_browser(hwnd, state, &current_code, &friendly);
                     }
                 }
             }
