@@ -150,7 +150,17 @@ struct Cli {
     /// Renderizar 1 solo video largo del álbum completo con capítulos y timestamps
     #[arg(long)]
     full_album: bool,
+
+    /// Extender los videos individuales en loop hasta N minutos (se ignora en --full-album)
+    #[arg(long)]
+    loop_minutes: Option<u32>,
+
+    /// Duración del fade-out final en segundos cuando el loop está activo
+    #[arg(long, default_value_t = 5.0)]
+    fade_out_secs: f64,
 }
+
+static SLICE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) struct RenderConfig {
     pub input: PathBuf,
@@ -167,6 +177,61 @@ pub(crate) struct RenderConfig {
     pub copy_audio: bool,
     pub overwrite: bool,
     pub ffmpeg_path: Option<PathBuf>,
+    pub loop_minutes: Option<u32>,
+    pub fade_out_secs: f64,
+}
+
+pub(crate) fn format_loop_label(loop_minutes: Option<u32>) -> Option<String> {
+    let m = loop_minutes?;
+    if m == 0 {
+        return None;
+    }
+    if m == 60 {
+        Some("1 hour Extended".to_string())
+    } else if m % 60 == 0 {
+        Some(format!("{} hours Extended", m / 60))
+    } else {
+        Some(format!("{} min Extended", m))
+    }
+}
+
+pub(crate) fn apply_loop_suffix_to_stem(stem: &str, loop_minutes: Option<u32>) -> String {
+    if let Some(label) = format_loop_label(loop_minutes) {
+        format!("{} ({})", stem, label)
+    } else {
+        stem.to_string()
+    }
+}
+
+pub(crate) fn apply_loop_suffix_to_title(title: &str, loop_minutes: Option<u32>) -> String {
+    let trimmed = title.trim();
+    if let Some(label) = format_loop_label(loop_minutes) {
+        if !trimmed.to_ascii_lowercase().contains("extended") {
+            let suffix = format!(" ({})", label);
+            let max_base = 100usize.saturating_sub(suffix.chars().count());
+            return format!("{}{}", vgmdb::truncate_chars(trimmed, max_base), suffix);
+        }
+    }
+    vgmdb::truncate_chars(trimmed, 100)
+}
+
+fn compute_loop_plan(
+    source_duration_secs: Option<f64>,
+    loop_minutes: Option<u32>,
+    fade_out_secs: f64,
+) -> Option<(f64, f64)> {
+    let m = loop_minutes?;
+    if m == 0 {
+        return None;
+    }
+    let target_secs = (m as f64) * 60.0;
+    if let Some(src) = source_duration_secs {
+        if src.is_finite() && src + 0.5 >= target_secs {
+            return None;
+        }
+    }
+    let effective_fade = fade_out_secs.clamp(0.0, (target_secs / 3.0).max(0.0));
+    Some((target_secs, effective_fade))
 }
 
 pub(crate) struct RenderJob {
@@ -414,12 +479,14 @@ pub(crate) fn output_path_for(
     input_base: &Path,
     output_dir: &Path,
     recursive: bool,
+    loop_minutes: Option<u32>,
 ) -> PathBuf {
     let stem = mp3_path
         .file_stem()
         .unwrap_or_else(|| OsStr::new("video"))
         .to_string_lossy();
-    let file_name = format!("{}.mp4", stem);
+    let final_stem = apply_loop_suffix_to_stem(&stem, loop_minutes);
+    let file_name = format!("{}.mp4", final_stem);
 
     if recursive {
         if let Ok(rel) = mp3_path.strip_prefix(input_base) {
@@ -586,9 +653,14 @@ fn finalize_ffmpeg_render(
     temp_output: &Path,
     output_path: &Path,
     err_ctx: &str,
+    output_duration_secs: Option<f64>,
 ) -> Result<()> {
-    cmd.arg("-shortest")
-        .arg("-max_interleave_delta")
+    if let Some(dur) = output_duration_secs {
+        cmd.arg("-t").arg(format!("{:.3}", dur));
+    } else {
+        cmd.arg("-shortest");
+    }
+    cmd.arg("-max_interleave_delta")
         .arg("100M")
         .arg("-movflags")
         .arg("+faststart")
@@ -623,6 +695,63 @@ fn finalize_ffmpeg_render(
     Ok(())
 }
 
+fn extract_temp_audio_slice(
+    ffmpeg: &Path,
+    audio_path: &Path,
+    start_secs: f64,
+    end_secs: Option<f64>,
+) -> Result<PathBuf> {
+    let seq = SLICE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_slice = std::env::temp_dir().join(format!(
+        "mp3video_loop_slice_{}_{}_{}.flac",
+        std::process::id(),
+        nanos,
+        seq
+    ));
+
+    let mut cmd = new_hidden_command(ffmpeg);
+    cmd.arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-ss")
+        .arg(format!("{:.3}", start_secs.max(0.0)));
+    if let Some(end) = end_secs {
+        let dur = (end - start_secs).max(0.1);
+        cmd.arg("-t").arg(format!("{:.3}", dur));
+    }
+    cmd.arg("-i")
+        .arg(audio_path)
+        .arg("-vn")
+        .arg("-c:a")
+        .arg("flac")
+        .arg("-compression_level")
+        .arg("0")
+        .arg(&temp_slice);
+
+    let out = cmd
+        .output()
+        .with_context(|| format!("No se pudo extraer segmento para loop desde {}", audio_path.display()))?;
+    if !out.status.success() {
+        let _ = fs::remove_file(&temp_slice);
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        bail!(
+            "Error extrayendo segmento de audio para loop ({}): {}",
+            audio_path.display(),
+            if stderr.is_empty() {
+                "ffmpeg falló".to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+    Ok(temp_slice)
+}
+
 fn run_ffmpeg_video_render(
     ffmpeg: &Path,
     audio_path: &Path,
@@ -640,11 +769,66 @@ fn run_ffmpeg_video_render(
         })?;
     }
 
+    let source_duration = match time_range {
+        Some((start, Some(end))) => Some((end - start).max(0.1)),
+        Some((start, None)) => {
+            cue::probe_audio_duration(audio_path, Some(ffmpeg)).map(|t| (t - start).max(0.1))
+        }
+        None => cue::probe_audio_duration(audio_path, Some(ffmpeg)),
+    };
+
+    let loop_plan = compute_loop_plan(source_duration, cfg.loop_minutes, cfg.fade_out_secs);
+
     let file_name = output_path
         .file_name()
         .unwrap_or_else(|| OsStr::new("video.mp4"))
         .to_string_lossy();
     let temp_output = output_path.with_file_name(format!(".{}.part.mp4", file_name));
+
+    if let Some((target_secs, fade_secs)) = loop_plan {
+        let temp_slice = if let Some((start_secs, end_secs)) = time_range {
+            Some(extract_temp_audio_slice(ffmpeg, audio_path, start_secs, end_secs)?)
+        } else {
+            None
+        };
+        let effective_audio = temp_slice.as_deref().unwrap_or(audio_path);
+
+        let mut cmd = new_hidden_command(ffmpeg);
+        cmd.arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-y")
+            .arg("-loop")
+            .arg("1")
+            .arg("-framerate")
+            .arg(cfg.fps.to_string())
+            .arg("-i")
+            .arg(image_path)
+            .arg("-stream_loop")
+            .arg("-1")
+            .arg("-i")
+            .arg(effective_audio);
+
+        apply_video_and_codec_args(&mut cmd, cfg, Some(effective_audio), false);
+
+        if fade_secs > 0.05 {
+            let fade_start = (target_secs - fade_secs).max(0.0);
+            cmd.arg("-af")
+                .arg(format!("afade=t=out:st={:.3}:d={:.3}", fade_start, fade_secs));
+        }
+
+        let res = finalize_ffmpeg_render(
+            cmd,
+            &temp_output,
+            output_path,
+            &audio_path.display().to_string(),
+            Some(target_secs),
+        );
+        if let Some(slice_path) = temp_slice {
+            let _ = fs::remove_file(slice_path);
+        }
+        return res;
+    }
 
     let mut cmd = new_hidden_command(ffmpeg);
     cmd.arg("-hide_banner")
@@ -668,7 +852,13 @@ fn run_ffmpeg_video_render(
 
     cmd.arg("-i").arg(audio_path);
     apply_video_and_codec_args(&mut cmd, cfg, Some(audio_path), time_range.is_none());
-    finalize_ffmpeg_render(cmd, &temp_output, output_path, &audio_path.display().to_string())
+    finalize_ffmpeg_render(
+        cmd,
+        &temp_output,
+        output_path,
+        &audio_path.display().to_string(),
+        None,
+    )
 }
 
 pub(crate) fn full_album_output_path(
@@ -762,6 +952,7 @@ pub(crate) fn render_full_album_to_mp4(
         &temp_output,
         output_path,
         &fallback_audio.display().to_string(),
+        None,
     );
     let _ = fs::remove_file(&ffmeta_path);
     let _ = fs::remove_file(&concat_path);
@@ -887,6 +1078,7 @@ pub(crate) fn build_upload_items_for_cue(
     album: Option<&vgmdb::AlbumMetadata>,
     title_tpl: &str,
     desc_tpl: &str,
+    loop_minutes: Option<u32>,
 ) -> Vec<youtube::UploadItem> {
     tracks
         .iter()
@@ -923,9 +1115,16 @@ pub(crate) fn build_upload_items_for_cue(
                     .or_else(|| cue_sheet.date.clone())
                     .unwrap_or_default(),
             };
-            let title = vgmdb::format_title(title_tpl, &meta);
+            let base_title = vgmdb::format_title(title_tpl, &meta);
+            let title = apply_loop_suffix_to_title(&base_title, loop_minutes);
             let description = vgmdb::format_description(desc_tpl, &meta);
-            let tags = vgmdb::build_tags(&meta);
+            let mut tags = vgmdb::build_tags(&meta);
+            if loop_minutes.is_some()
+                && !tags.iter().any(|t| t.eq_ignore_ascii_case("Extended"))
+                && tags.len() < 15
+            {
+                tags.push("Extended".to_string());
+            }
             youtube::UploadItem {
                 mp4_path: mp4.clone(),
                 title,
@@ -942,6 +1141,7 @@ pub(crate) fn build_upload_items(
     ffmpeg_path: Option<&Path>,
     title_tpl: &str,
     desc_tpl: &str,
+    loop_minutes: Option<u32>,
 ) -> Vec<youtube::UploadItem> {
     pairs
         .iter()
@@ -950,9 +1150,16 @@ pub(crate) fn build_upload_items(
         .map(|(idx, (tag_source, mp4))| {
             let id3 = vgmdb::read_mp3_tags(tag_source, ffmpeg_path);
             let meta = vgmdb::match_track_for_file(tag_source, idx, album, &id3);
-            let title = vgmdb::format_title(title_tpl, &meta);
+            let base_title = vgmdb::format_title(title_tpl, &meta);
+            let title = apply_loop_suffix_to_title(&base_title, loop_minutes);
             let description = vgmdb::format_description(desc_tpl, &meta);
-            let tags = vgmdb::build_tags(&meta);
+            let mut tags = vgmdb::build_tags(&meta);
+            if loop_minutes.is_some()
+                && !tags.iter().any(|t| t.eq_ignore_ascii_case("Extended"))
+                && tags.len() < 15
+            {
+                tags.push("Extended".to_string());
+            }
             youtube::UploadItem {
                 mp4_path: mp4.clone(),
                 title,
@@ -1091,6 +1298,10 @@ fn run_cli() -> Result<()> {
     if cli.crf > 51 {
         bail!("El valor de --crf debe estar entre 0 y 51.");
     }
+    if !cli.fade_out_secs.is_finite() || cli.fade_out_secs < 0.0 {
+        bail!("La duración de --fade-out-secs debe ser mayor o igual a 0.");
+    }
+    let loop_minutes = cli.loop_minutes.filter(|&m| m > 0);
 
     let yt_privacy = youtube::PrivacyStatus::from_str_lossy(&cli.youtube_privacy)?;
     if cli.youtube_upload
@@ -1131,6 +1342,8 @@ fn run_cli() -> Result<()> {
         copy_audio: cli.copy_audio,
         overwrite: cli.overwrite,
         ffmpeg_path: cli.ffmpeg_path,
+        loop_minutes,
+        fade_out_secs: cli.fade_out_secs,
     };
 
     let ffmpeg = find_ffmpeg(cfg.ffmpeg_path.as_deref())?;
@@ -1199,7 +1412,8 @@ fn run_cli() -> Result<()> {
     let mut skipped_count = 0usize;
 
     for mp3_path in mp3_files {
-        let output_path = output_path_for(&mp3_path, &input_base, &cfg.output, cfg.recursive);
+        let output_path =
+            output_path_for(&mp3_path, &input_base, &cfg.output, cfg.recursive, cfg.loop_minutes);
         all_pairs.push((mp3_path.clone(), output_path.clone()));
         if output_path.exists() && !cfg.overwrite {
             skipped_count += 1;
@@ -1212,14 +1426,18 @@ fn run_cli() -> Result<()> {
     }
 
     let total_pending = pending_jobs.len();
+    let loop_note = format_loop_label(cfg.loop_minutes)
+        .map(|l| format!(" | Loop: {} (fade-out {:.1}s)", l, cfg.fade_out_secs))
+        .unwrap_or_default();
     println!(
-        "FFmpeg: {} | Resolución: {}x{} | Ajuste: {:?} | FPS: {} | Hilos: {}",
+        "FFmpeg: {} | Resolución: {}x{} | Ajuste: {:?} | FPS: {} | Hilos: {}{}",
         ffmpeg.display(),
         cfg.width,
         cfg.height,
         cfg.fit,
         cfg.fps,
-        cfg.jobs
+        cfg.jobs,
+        loop_note
     );
     if skipped_count > 0 {
         println!(
@@ -1332,6 +1550,7 @@ fn run_cli() -> Result<()> {
         cfg.ffmpeg_path.as_deref(),
         &cli.title_template,
         &cli.desc_template,
+        cfg.loop_minutes,
     );
     for item in &upload_items {
         let _ = write_video_sidecar_txt(item);
@@ -1457,6 +1676,11 @@ fn run_cue_cli(
     fs::create_dir_all(&cfg.output)?;
 
     if full_album {
+        if cfg.loop_minutes.is_some() {
+            println!(
+                "[AVISO] Modo Álbum Completo activo: el loop extendido se omite para conservar los capítulos."
+            );
+        }
         let out_mp4 = full_album_output_path(&cfg.output, cue_sheet, album_meta);
         let alb_title = album_meta
             .map(|a| a.album_title.as_str())
@@ -1529,7 +1753,7 @@ fn run_cue_cli(
     let mut skipped_count = 0usize;
 
     for tr in &cue_sheet.tracks {
-        let stem = cue::cue_track_output_stem(tr);
+        let stem = apply_loop_suffix_to_stem(&cue::cue_track_output_stem(tr), cfg.loop_minutes);
         let out_mp4 = cfg.output.join(format!("{}.mp4", stem));
         all_pairs.push((tr.clone(), out_mp4.clone()));
         if out_mp4.exists() && !cfg.overwrite {
@@ -1589,6 +1813,7 @@ fn run_cue_cli(
         album_meta,
         title_tpl,
         desc_tpl,
+        cfg.loop_minutes,
     );
     for item in &upload_items {
         let _ = write_video_sidecar_txt(item);
@@ -1650,5 +1875,76 @@ fn main() {
     } else if let Err(err) = gui::run_gui() {
         gui::show_fatal_error(&format!("{:#}", err));
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+
+    #[test]
+    fn test_format_loop_label() {
+        assert_eq!(format_loop_label(None), None);
+        assert_eq!(format_loop_label(Some(0)), None);
+        assert_eq!(
+            format_loop_label(Some(15)),
+            Some("15 min Extended".to_string())
+        );
+        assert_eq!(
+            format_loop_label(Some(60)),
+            Some("1 hour Extended".to_string())
+        );
+        assert_eq!(
+            format_loop_label(Some(120)),
+            Some("2 hours Extended".to_string())
+        );
+    }
+
+    #[test]
+    fn test_apply_loop_suffix_to_stem_and_title() {
+        assert_eq!(
+            apply_loop_suffix_to_stem("01 - Prelude", None),
+            "01 - Prelude"
+        );
+        assert_eq!(
+            apply_loop_suffix_to_stem("01 - Prelude", Some(30)),
+            "01 - Prelude (30 min Extended)"
+        );
+        assert_eq!(
+            apply_loop_suffix_to_title("Final Fantasy VII - 01. The Prelude", Some(30)),
+            "Final Fantasy VII - 01. The Prelude (30 min Extended)"
+        );
+        assert_eq!(
+            apply_loop_suffix_to_title("Already (Extended) Track", Some(30)),
+            "Already (Extended) Track"
+        );
+
+        let very_long = "A".repeat(98);
+        let titled = apply_loop_suffix_to_title(&very_long, Some(60));
+        assert!(titled.chars().count() <= 100);
+        assert!(titled.ends_with(" (1 hour Extended)"));
+    }
+
+    #[test]
+    fn test_compute_loop_plan() {
+        // Desactivado
+        assert_eq!(compute_loop_plan(Some(120.0), None, 5.0), None);
+        assert_eq!(compute_loop_plan(Some(120.0), Some(0), 5.0), None);
+
+        // Audio más corto (3 min) extendido a 15 min (900s) con fade de 5s
+        assert_eq!(
+            compute_loop_plan(Some(180.0), Some(15), 5.0),
+            Some((900.0, 5.0))
+        );
+
+        // Audio ya igual o más largo que el objetivo -> no recorta ni loopea
+        assert_eq!(compute_loop_plan(Some(900.0), Some(15), 5.0), None);
+        assert_eq!(compute_loop_plan(Some(1200.0), Some(15), 5.0), None);
+
+        // Sin duración detectada pero loop activo -> extiende igual
+        assert_eq!(compute_loop_plan(None, Some(15), 5.0), Some((900.0, 5.0)));
+
+        // Fade acotado cuando se pasa un valor exagerado (máximo target / 3)
+        assert_eq!(compute_loop_plan(Some(10.0), Some(1), 50.0), Some((60.0, 20.0)));
     }
 }

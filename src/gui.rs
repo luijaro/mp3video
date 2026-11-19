@@ -49,14 +49,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     IsDialogMessageW, LoadCursorW, LoadIconW, MessageBoxW, PostMessageW, PostQuitMessage,
     RegisterClassExW, SendMessageW, SetProcessDPIAware, SetWindowLongPtrW, SetWindowTextW,
     ShowWindow, TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON,
-    BS_GROUPBOX, BS_PUSHBUTTON, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL,
-    CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY,
-    GWLP_USERDATA, HMENU, IDC_ARROW, IDI_APPLICATION, IDYES, MB_ICONERROR, MB_ICONINFORMATION,
-    MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_SHOWNORMAL,
-    WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DROPFILES,
-    WM_SETFONT, WNDCLASSEXW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE,
-    WS_GROUP, WS_HSCROLL, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
-    WS_VSCROLL,
+    BS_GROUPBOX, BS_PUSHBUTTON, CBN_SELCHANGE, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL,
+    CB_SETCURSEL, CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_NUMBER,
+    ES_READONLY, GWLP_USERDATA, HMENU, IDC_ARROW, IDI_APPLICATION, IDYES, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MSG, SM_CXSCREEN,
+    SM_CYSCREEN, SW_SHOWNORMAL, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORSTATIC,
+    WM_DESTROY, WM_DROPFILES, WM_SETFONT, WNDCLASSEXW, WS_BORDER, WS_CAPTION, WS_CHILD,
+    WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_GROUP, WS_HSCROLL, WS_MINIMIZEBOX, WS_OVERLAPPED,
+    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::cue::{
@@ -75,11 +75,12 @@ use crate::youtube::{
     PrivacyStatus,
 };
 use crate::{
-    build_full_album_upload_item, build_upload_items, build_upload_items_for_cue,
-    collect_audio_files, default_jobs, find_ffmpeg, full_album_output_path, has_extension,
-    output_path_for, render_cue_track_to_mp4, render_full_album_to_mp4, render_single,
-    resolve_image, write_master_tracklist_txt, write_video_sidecar_txt, FitMode, RenderConfig,
-    RenderJob, AUDIO_EXTENSIONS, DEFAULT_DESC_TEMPLATE, DEFAULT_TITLE_TEMPLATE, IMAGE_EXTENSIONS,
+    apply_loop_suffix_to_stem, build_full_album_upload_item, build_upload_items,
+    build_upload_items_for_cue, collect_audio_files, default_jobs, find_ffmpeg, format_loop_label,
+    full_album_output_path, has_extension, output_path_for, render_cue_track_to_mp4,
+    render_full_album_to_mp4, render_single, resolve_image, write_master_tracklist_txt,
+    write_video_sidecar_txt, FitMode, RenderConfig, RenderJob, AUDIO_EXTENSIONS,
+    DEFAULT_DESC_TEMPLATE, DEFAULT_TITLE_TEMPLATE, IMAGE_EXTENSIONS,
 };
 
 const ACTCTX_FLAG_RESOURCE_NAME_VALID: u32 = 0x0000_0008;
@@ -110,6 +111,7 @@ const ID_CHK_FULL_ALBUM: usize = 115;
 const ID_BTN_VGMDB_JSON: usize = 116;
 const ID_BTN_VGMDB_PASTE: usize = 117;
 const ID_BTN_VGMDB_OPEN: usize = 118;
+const ID_COMBO_LOOP: usize = 119;
 
 const RESOLUTIONS: &[(&str, (u32, u32))] = &[
     ("1920x1080 (Full HD 16:9)", (1920, 1080)),
@@ -162,6 +164,15 @@ const PRIVACY_PRESETS: &[(&str, PrivacyStatus)] = &[
     ("Público", PrivacyStatus::Public),
 ];
 
+const LOOP_PRESETS: &[(&str, Option<u32>)] = &[
+    ("Sin loop (Original)", None),
+    ("15 minutos", Some(15)),
+    ("30 minutos", Some(30)),
+    ("1 hora (60 min)", Some(60)),
+    ("Personalizado (min)", Some(0)),
+];
+const LOOP_PRESET_CUSTOM_IDX: usize = 4;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct AppSettings {
@@ -181,6 +192,8 @@ struct AppSettings {
     fps_idx: usize,
     crf_idx: usize,
     privacy_idx: usize,
+    loop_idx: usize,
+    loop_custom_minutes: String,
     recursive: bool,
     overwrite: bool,
     yt_upload_after: bool,
@@ -212,6 +225,8 @@ impl Default for AppSettings {
             fps_idx: 0,
             crf_idx: 0,
             privacy_idx: 0,
+            loop_idx: 0,
+            loop_custom_minutes: "45".to_string(),
             recursive: false,
             overwrite: false,
             yt_upload_after: false,
@@ -258,6 +273,8 @@ struct GuiState {
     combo_crf: HWND,
     chk_recursive: HWND,
     chk_overwrite: HWND,
+    combo_loop: HWND,
+    edit_loop_custom: HWND,
     edit_vgmdb_code: HWND,
     btn_vgmdb_paste: HWND,
     btn_vgmdb_search: HWND,
@@ -318,6 +335,8 @@ impl GuiState {
             combo_crf: null_mut(),
             chk_recursive: null_mut(),
             chk_overwrite: null_mut(),
+            combo_loop: null_mut(),
+            edit_loop_custom: null_mut(),
             edit_vgmdb_code: null_mut(),
             btn_vgmdb_paste: null_mut(),
             btn_vgmdb_search: null_mut(),
@@ -360,7 +379,7 @@ impl GuiState {
         (logical_px * self.dpi + 48) / 96
     }
 
-    fn editable_controls(&self) -> [HWND; 36] {
+    fn editable_controls(&self) -> [HWND; 38] {
         [
             self.edit_input,
             self.btn_browse_input_dir,
@@ -378,6 +397,8 @@ impl GuiState {
             self.combo_crf,
             self.chk_recursive,
             self.chk_overwrite,
+            self.combo_loop,
+            self.edit_loop_custom,
             self.edit_vgmdb_code,
             self.btn_vgmdb_paste,
             self.btn_vgmdb_search,
@@ -437,6 +458,8 @@ fn save_settings(state: &GuiState) {
         fps_idx: combo_selected_idx(state.combo_fps),
         crf_idx: combo_selected_idx(state.combo_crf),
         privacy_idx: combo_selected_idx(state.combo_privacy),
+        loop_idx: combo_selected_idx(state.combo_loop),
+        loop_custom_minutes: get_window_text(state.edit_loop_custom).trim().to_string(),
         recursive: is_checked(state.chk_recursive),
         overwrite: is_checked(state.chk_overwrite),
         yt_upload_after: is_checked(state.chk_yt_upload_after),
@@ -1365,12 +1388,12 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
     state.chk_recursive = create_child(
         hwnd,
         "BUTTON",
-        "Buscar también en subcarpetas",
+        "Incluir subcarpetas",
         BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
         0,
-        state.px(108),
+        state.px(28),
         state.px(205),
-        state.px(220),
+        state.px(195),
         state.px(20),
         0,
         f_reg,
@@ -1380,17 +1403,73 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
     state.chk_overwrite = create_child(
         hwnd,
         "BUTTON",
-        "Sobrescribir archivos existentes",
+        "Sobrescribir existentes",
         BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
         0,
-        state.px(376),
+        state.px(228),
         state.px(205),
-        state.px(260),
+        state.px(182),
         state.px(20),
         0,
         f_reg,
     );
     set_checked(state.chk_overwrite, saved.overwrite);
+
+    create_child(
+        hwnd,
+        "STATIC",
+        "Loop:",
+        0,
+        0,
+        state.px(422),
+        state.px(207),
+        state.px(38),
+        state.px(18),
+        0,
+        f_reg,
+    );
+    state.combo_loop = create_child(
+        hwnd,
+        "COMBOBOX",
+        "",
+        CBS_DROPDOWNLIST as u32 | WS_TABSTOP | WS_VSCROLL,
+        0,
+        state.px(464),
+        state.px(203),
+        state.px(170),
+        state.px(200),
+        ID_COMBO_LOOP,
+        f_reg,
+    );
+    populate_combo(state.combo_loop, LOOP_PRESETS, saved.loop_idx);
+
+    state.edit_loop_custom = create_child(
+        hwnd,
+        "EDIT",
+        &saved.loop_custom_minutes,
+        ES_NUMBER as u32 | ES_AUTOHSCROLL as u32 | WS_TABSTOP | WS_BORDER,
+        WS_EX_CLIENTEDGE,
+        state.px(640),
+        state.px(203),
+        state.px(54),
+        state.px(23),
+        0,
+        f_reg,
+    );
+    create_child(
+        hwnd,
+        "STATIC",
+        "min (fade-out 5s)",
+        0,
+        0,
+        state.px(700),
+        state.px(207),
+        state.px(170),
+        state.px(16),
+        0,
+        f_small,
+    );
+    update_loop_custom_enabled(state);
 
     // Grupo MusicBrainz / Discogs / VGMdb
     create_child(
@@ -1988,6 +2067,13 @@ fn build_controls(hwnd: HWND, state: &mut GuiState) {
     }
 }
 
+fn update_loop_custom_enabled(state: &GuiState) {
+    let custom_active = !state.is_running && combo_selected_idx(state.combo_loop) == LOOP_PRESET_CUSTOM_IDX;
+    unsafe {
+        EnableWindow(state.edit_loop_custom, if custom_active { 1 } else { 0 });
+    }
+}
+
 fn set_running_ui(state: &mut GuiState, running: bool) {
     state.is_running = running;
     let enable_inputs: BOOL = if running { 0 } else { 1 };
@@ -2000,6 +2086,7 @@ fn set_running_ui(state: &mut GuiState, running: bool) {
         EnableWindow(state.btn_start, enable_inputs);
         EnableWindow(state.btn_cancel, if running { 1 } else { 0 });
     }
+    update_loop_custom_enabled(state);
 }
 
 fn build_effective_album_meta(state: &GuiState) -> Option<AlbumMetadata> {
@@ -2094,6 +2181,22 @@ fn read_upload_settings(state: &GuiState, require_yt_auth: bool) -> Result<Uploa
     })
 }
 
+fn resolve_gui_loop_minutes(state: &GuiState) -> Result<Option<u32>> {
+    let idx = combo_selected_idx(state.combo_loop);
+    if idx == LOOP_PRESET_CUSTOM_IDX {
+        let raw = get_window_text(state.edit_loop_custom);
+        let trimmed = raw.trim();
+        let mins: u32 = trimmed.parse().map_err(|_| {
+            anyhow::anyhow!("Ingresá una duración de loop personalizada válida en minutos (entre 1 y 600).")
+        })?;
+        if !(1..=600).contains(&mins) {
+            bail!("La duración personalizada del loop debe estar entre 1 y 600 minutos.");
+        }
+        return Ok(Some(mins));
+    }
+    Ok(LOOP_PRESETS.get(idx).and_then(|(_, m)| *m))
+}
+
 fn read_gui_config(state: &GuiState) -> Result<RenderConfig> {
     let input_raw = get_window_text(state.edit_input).trim().to_string();
     if input_raw.is_empty() {
@@ -2152,6 +2255,7 @@ fn read_gui_config(state: &GuiState) -> Result<RenderConfig> {
         .get(combo_selected_idx(state.combo_crf))
         .map(|(_, c)| *c)
         .unwrap_or(18);
+    let loop_minutes = resolve_gui_loop_minutes(state)?;
 
     Ok(RenderConfig {
         input,
@@ -2168,6 +2272,8 @@ fn read_gui_config(state: &GuiState) -> Result<RenderConfig> {
         copy_audio,
         overwrite: is_checked(state.chk_overwrite),
         ffmpeg_path: None,
+        loop_minutes,
+        fade_out_secs: 5.0,
     })
 }
 
@@ -2401,7 +2507,7 @@ fn start_render(hwnd: HWND, state: &mut GuiState) {
         return;
     }
 
-    let cfg = match read_gui_config(state) {
+    let mut cfg = match read_gui_config(state) {
         Ok(c) => c,
         Err(err) => {
             show_msg_box(
@@ -2415,6 +2521,10 @@ fn start_render(hwnd: HWND, state: &mut GuiState) {
     };
 
     let full_album = is_checked(state.chk_full_album);
+    let loop_ignored_for_full_album = full_album && cfg.loop_minutes.is_some();
+    if loop_ignored_for_full_album {
+        cfg.loop_minutes = None;
+    }
     let cue_job = match active_cue_with_reviewed_tracks(state, &cfg.input) {
         Ok(c) => c,
         Err(err) => {
@@ -2467,16 +2577,30 @@ fn start_render(hwnd: HWND, state: &mut GuiState) {
         },
     );
     set_window_text(state.edit_log, "");
+    if loop_ignored_for_full_album {
+        append_log(
+            state.edit_log,
+            "[AVISO] Modo Álbum Completo activo: el loop extendido se omite para conservar los capítulos.",
+        );
+    }
+    let loop_note = if !full_album {
+        format_loop_label(cfg.loop_minutes)
+            .map(|l| format!(" | Loop: {} (fade-out 5s)", l))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     append_log(
         state.edit_log,
         &format!(
-            "Iniciando: {}x{} | {:?} | {} fps | {} hilo(s){}",
+            "Iniciando: {}x{} | {:?} | {} fps | {} hilo(s){}{}",
             cfg.width,
             cfg.height,
             cfg.fit,
             cfg.fps,
             cfg.jobs,
-            if full_album { " | MODO ÁLBUM COMPLETO" } else { "" }
+            if full_album { " | MODO ÁLBUM COMPLETO" } else { "" },
+            loop_note
         ),
     );
 
@@ -2659,6 +2783,11 @@ fn start_upload_only(hwnd: HWND, state: &mut GuiState) {
     let input_path = PathBuf::from(get_window_text(state.edit_input).trim());
     let recursive = is_checked(state.chk_recursive);
     let full_album = is_checked(state.chk_full_album);
+    let loop_minutes = if full_album {
+        None
+    } else {
+        resolve_gui_loop_minutes(state).ok().flatten()
+    };
     let cue_job = active_cue_with_reviewed_tracks(state, &input_path).ok().flatten();
 
     save_settings(state);
@@ -2679,6 +2808,7 @@ fn start_upload_only(hwnd: HWND, state: &mut GuiState) {
             &output_dir,
             recursive,
             full_album,
+            loop_minutes,
             cue_job,
             &upload_cfg,
             &cancel_flag,
@@ -2691,6 +2821,7 @@ fn collect_mp4_pairs_for_upload(
     input_path: &Path,
     output_dir: &Path,
     recursive: bool,
+    loop_minutes: Option<u32>,
 ) -> Vec<(PathBuf, PathBuf)> {
     if input_path.exists() {
         if let Ok((input_base, audio_files)) =
@@ -2698,7 +2829,7 @@ fn collect_mp4_pairs_for_upload(
         {
             let mut pairs = Vec::new();
             for audio in audio_files {
-                let mp4 = output_path_for(&audio, &input_base, output_dir, recursive);
+                let mp4 = output_path_for(&audio, &input_base, output_dir, recursive, loop_minutes);
                 if mp4.is_file() {
                     pairs.push((audio, mp4));
                 }
@@ -2776,12 +2907,14 @@ fn execute_youtube_upload_items(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_gui_upload_only(
     hwnd: HWND,
     input_path: &Path,
     output_dir: &Path,
     recursive: bool,
     full_album: bool,
+    loop_minutes: Option<u32>,
     cue_job: Option<(CueSheet, Vec<CueTrack>)>,
     upload_cfg: &UploadSettings,
     cancel_flag: &AtomicBool,
@@ -2811,19 +2944,22 @@ fn run_gui_upload_only(
         let cue_pairs: Vec<(CueTrack, PathBuf)> = tracks
             .iter()
             .map(|tr| {
-                let out = output_dir.join(format!("{}.mp4", cue_track_output_stem(tr)));
+                let stem = apply_loop_suffix_to_stem(&cue_track_output_stem(tr), loop_minutes);
+                let out = output_dir.join(format!("{}.mp4", stem));
                 (tr.clone(), out)
             })
             .filter(|(_, p)| p.is_file())
             .collect();
         if cue_pairs.is_empty() {
-            let fallback_pairs = collect_mp4_pairs_for_upload(input_path, output_dir, recursive);
+            let fallback_pairs =
+                collect_mp4_pairs_for_upload(input_path, output_dir, recursive, loop_minutes);
             build_upload_items(
                 &fallback_pairs,
                 upload_cfg.album_meta.as_ref(),
                 None,
                 &upload_cfg.title_template,
                 &upload_cfg.desc_template,
+                loop_minutes,
             )
         } else {
             build_upload_items_for_cue(
@@ -2832,16 +2968,18 @@ fn run_gui_upload_only(
                 upload_cfg.album_meta.as_ref(),
                 &upload_cfg.title_template,
                 &upload_cfg.desc_template,
+                loop_minutes,
             )
         }
     } else {
-        let pairs = collect_mp4_pairs_for_upload(input_path, output_dir, recursive);
+        let pairs = collect_mp4_pairs_for_upload(input_path, output_dir, recursive, loop_minutes);
         build_upload_items(
             &pairs,
             upload_cfg.album_meta.as_ref(),
             None,
             &upload_cfg.title_template,
             &upload_cfg.desc_template,
+            loop_minutes,
         )
     };
 
@@ -3155,7 +3293,8 @@ fn run_gui_cue_render(
     let mut skipped_count = 0usize;
 
     for tr in tracks {
-        let out_mp4 = cfg.output.join(format!("{}.mp4", cue_track_output_stem(tr)));
+        let stem = apply_loop_suffix_to_stem(&cue_track_output_stem(tr), cfg.loop_minutes);
+        let out_mp4 = cfg.output.join(format!("{}.mp4", stem));
         all_pairs.push((tr.clone(), out_mp4.clone()));
         if out_mp4.exists() && !cfg.overwrite {
             skipped_count += 1;
@@ -3229,7 +3368,9 @@ fn run_gui_cue_render(
                 ) {
                     Ok(()) => {
                         ok_count.fetch_add(1, Ordering::Relaxed);
-                        post_boxed(hwnd, WM_APP_LOG, 0, format!("[OK] {}.mp4", label));
+                        let done_stem =
+                            apply_loop_suffix_to_stem(&cue_track_output_stem(tr), cfg.loop_minutes);
+                        post_boxed(hwnd, WM_APP_LOG, 0, format!("[OK] {}.mp4", done_stem));
                     }
                     Err(err) => {
                         err_count.fetch_add(1, Ordering::Relaxed);
@@ -3272,6 +3413,7 @@ fn run_gui_cue_render(
         upload_cfg.album_meta.as_ref(),
         &upload_cfg.title_template,
         &upload_cfg.desc_template,
+        cfg.loop_minutes,
     );
     for item in &upload_items {
         let _ = write_video_sidecar_txt(item);
@@ -3391,7 +3533,13 @@ fn run_gui_batch(
     let mut pending_jobs = Vec::new();
     let mut skipped_count = 0usize;
     for audio_path in audio_files {
-        let output_path = output_path_for(&audio_path, &input_base, &cfg.output, cfg.recursive);
+        let output_path = output_path_for(
+            &audio_path,
+            &input_base,
+            &cfg.output,
+            cfg.recursive,
+            cfg.loop_minutes,
+        );
         all_pairs.push((audio_path.clone(), output_path.clone()));
         if output_path.exists() && !cfg.overwrite {
             skipped_count += 1;
@@ -3534,6 +3682,7 @@ fn run_gui_batch(
         Some(&ffmpeg),
         &upload_cfg.title_template,
         &upload_cfg.desc_template,
+        cfg.loop_minutes,
     );
     for item in &upload_items {
         let _ = write_video_sidecar_txt(item);
@@ -4048,7 +4197,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
     match msg {
         WM_COMMAND => {
             let cmd_id = wparam & 0xFFFF;
-            handle_command(hwnd, state, cmd_id);
+            let notify_code = (wparam >> 16) & 0xFFFF;
+            if cmd_id == ID_COMBO_LOOP {
+                if notify_code == CBN_SELCHANGE as usize {
+                    update_loop_custom_enabled(state);
+                    save_settings(state);
+                }
+            } else {
+                handle_command(hwnd, state, cmd_id);
+            }
             0
         }
         WM_DROPFILES => {
