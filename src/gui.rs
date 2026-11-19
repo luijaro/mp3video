@@ -3366,11 +3366,16 @@ fn run_gui_cue_render(
                     out_mp4,
                     cfg,
                 ) {
-                    Ok(()) => {
+                    Ok(loop_note) => {
                         ok_count.fetch_add(1, Ordering::Relaxed);
                         let done_stem =
                             apply_loop_suffix_to_stem(&cue_track_output_stem(tr), cfg.loop_minutes);
-                        post_boxed(hwnd, WM_APP_LOG, 0, format!("[OK] {}.mp4", done_stem));
+                        let msg = if let Some(note) = loop_note {
+                            format!("[OK] {}.mp4 [{}]", done_stem, note)
+                        } else {
+                            format!("[OK] {}.mp4", done_stem)
+                        };
+                        post_boxed(hwnd, WM_APP_LOG, 0, msg);
                     }
                     Err(err) => {
                         err_count.fetch_add(1, Ordering::Relaxed);
@@ -3625,19 +3630,19 @@ fn run_gui_batch(
                 };
 
                 match result {
-                    Ok(()) => {
+                    Ok(loop_note) => {
                         ok_count.fetch_add(1, Ordering::Relaxed);
                         let out_name = job
                             .output_path
                             .file_name()
                             .unwrap_or_else(|| OsStr::new("?"))
                             .to_string_lossy();
-                        post_boxed(
-                            hwnd,
-                            WM_APP_LOG,
-                            0,
-                            format!("[OK] {} -> {}", song_name, out_name),
-                        );
+                        let msg = if let Some(note) = loop_note {
+                            format!("[OK] {} -> {} [{}]", song_name, out_name, note)
+                        } else {
+                            format!("[OK] {} -> {}", song_name, out_name)
+                        };
+                        post_boxed(hwnd, WM_APP_LOG, 0, msg);
                     }
                     Err(err) => {
                         err_count.fetch_add(1, Ordering::Relaxed);

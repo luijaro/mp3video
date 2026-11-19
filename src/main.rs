@@ -2,6 +2,7 @@
 
 mod cue;
 mod gui;
+mod looper;
 mod vgmdb;
 mod youtube;
 
@@ -759,7 +760,7 @@ fn run_ffmpeg_video_render(
     image_path: &Path,
     output_path: &Path,
     cfg: &RenderConfig,
-) -> Result<()> {
+) -> Result<Option<String>> {
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent).with_context(|| {
             format!(
@@ -786,6 +787,49 @@ fn run_ffmpeg_video_render(
     let temp_output = output_path.with_file_name(format!(".{}.part.mp4", file_name));
 
     if let Some((target_secs, fade_secs)) = loop_plan {
+        if let Ok(prepared) =
+            looper::prepare_seamless_loop_concat(ffmpeg, audio_path, time_range, target_secs)
+        {
+            let mut cmd = new_hidden_command(ffmpeg);
+            cmd.arg("-hide_banner")
+                .arg("-loglevel")
+                .arg("error")
+                .arg("-y")
+                .arg("-loop")
+                .arg("1")
+                .arg("-framerate")
+                .arg(cfg.fps.to_string())
+                .arg("-i")
+                .arg(image_path)
+                .arg("-f")
+                .arg("concat")
+                .arg("-safe")
+                .arg("0")
+                .arg("-i")
+                .arg(&prepared.concat_list_path);
+
+            apply_video_and_codec_args(&mut cmd, cfg, None, false);
+
+            if fade_secs > 0.05 {
+                let fade_start = (target_secs - fade_secs).max(0.0);
+                cmd.arg("-af")
+                    .arg(format!("afade=t=out:st={:.3}:d={:.3}", fade_start, fade_secs));
+            }
+
+            let summary = prepared.detection.summary_label();
+            let res = finalize_ffmpeg_render(
+                cmd,
+                &temp_output,
+                output_path,
+                &audio_path.display().to_string(),
+                Some(target_secs),
+            );
+            prepared.cleanup();
+            res?;
+            return Ok(Some(summary));
+        }
+
+        // Fallback de seguridad a loop estándar si fallara la decodificación previa
         let temp_slice = if let Some((start_secs, end_secs)) = time_range {
             Some(extract_temp_audio_slice(ffmpeg, audio_path, start_secs, end_secs)?)
         } else {
@@ -827,7 +871,8 @@ fn run_ffmpeg_video_render(
         if let Some(slice_path) = temp_slice {
             let _ = fs::remove_file(slice_path);
         }
-        return res;
+        res?;
+        return Ok(Some("Loop estándar".to_string()));
     }
 
     let mut cmd = new_hidden_command(ffmpeg);
@@ -858,7 +903,8 @@ fn run_ffmpeg_video_render(
         output_path,
         &audio_path.display().to_string(),
         None,
-    )
+    )?;
+    Ok(None)
 }
 
 pub(crate) fn full_album_output_path(
@@ -1043,7 +1089,7 @@ pub(crate) fn render_single(
     job: &RenderJob,
     image_path: &Path,
     cfg: &RenderConfig,
-) -> Result<()> {
+) -> Result<Option<String>> {
     run_ffmpeg_video_render(
         ffmpeg,
         &job.mp3_path,
@@ -1061,7 +1107,7 @@ pub(crate) fn render_cue_track_to_mp4(
     image_path: &Path,
     output_path: &Path,
     cfg: &RenderConfig,
-) -> Result<()> {
+) -> Result<Option<String>> {
     run_ffmpeg_video_render(
         ffmpeg,
         audio_path,
@@ -1475,6 +1521,7 @@ fn run_cli() -> Result<()> {
             .collect();
 
         let rendered_count = AtomicUsize::new(0);
+        let loop_notes: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
         let errors: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
         let started = Instant::now();
 
@@ -1503,8 +1550,13 @@ fn run_cli() -> Result<()> {
                 };
 
                 match result {
-                    Ok(()) => {
+                    Ok(loop_note) => {
                         rendered_count.fetch_add(1, Ordering::Relaxed);
+                        if let Some(note) = loop_note {
+                            if let Ok(mut guard) = loop_notes.lock() {
+                                guard.push((song_name.to_string(), note));
+                            }
+                        }
                     }
                     Err(err) => {
                         if let Ok(mut guard) = errors.lock() {
@@ -1522,6 +1574,12 @@ fn run_cli() -> Result<()> {
             pb.finish_and_clear();
         }
         main_pb.finish_with_message("Completado");
+
+        if let Ok(notes) = loop_notes.into_inner() {
+            for (song, note) in notes {
+                println!("[LOOP] {}: {}", song, note);
+            }
+        }
 
         let elapsed = started.elapsed();
         let ok_count = rendered_count.load(Ordering::Relaxed);
@@ -1780,9 +1838,13 @@ fn run_cue_cli(
                     out_mp4,
                     cfg,
                 ) {
-                    Ok(()) => {
+                    Ok(loop_note) => {
                         ok_count.fetch_add(1, Ordering::Relaxed);
-                        println!("[OK] {:02} - {}", tr.track_number, tr.title);
+                        if let Some(note) = loop_note {
+                            println!("[OK] {:02} - {} [{}]", tr.track_number, tr.title, note);
+                        } else {
+                            println!("[OK] {:02} - {}", tr.track_number, tr.title);
+                        }
                     }
                     Err(e) => {
                         if let Ok(mut g) = errors.lock() {
